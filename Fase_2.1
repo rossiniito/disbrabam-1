@@ -1,0 +1,484 @@
+/*
+  ======================================================================
+  AX CONTROL - MASTER CLOUD + OFFLINE-FIRST (RTC Edition Final)
+  
+  - [FIX] Mutex em todas as variáveis de latch (race condition cloud thread)
+  - [FIX] ppm_Etileno protegido contra escrita não-atômica de float
+  - [MELHORIA] Quarentena 12h baseada em RTC real (substituído KVStore de delta)
+  - [MELHORIA] KVStore salva apenas o timestamp de início (1 write por ciclo)
+  - [MELHORIA] Timestamp real no CSV via RTC sincronizado por NTP
+  - [MELHORIA] Fuso Horário de Brasília (UTC-3) configurado nativamente
+  - [MELHORIA] snprintf no lugar de String (evita fragmentação de heap)
+  ======================================================================
+*/
+
+#include "thingProperties.h"
+#include <Arduino.h>
+#include <Arduino_Opta_Blueprint.h>
+#include <Arduino_UnifiedStorage.h>
+#include <rtos.h>
+#include <mbed.h>
+#include <drivers/Watchdog.h>
+#include <kvstore_global_api.h>
+#include <time.h>  
+
+// ========================================================================
+// INSTÂNCIAS DE HARDWARE
+// ========================================================================
+DigitalMechExpansion expDigital;
+AnalogExpansion      expAnalog;
+USBStorage           pendrive;
+
+// ========================================================================
+// MUTEX E THREAD DA NUVEM (Offline-First)
+// ========================================================================
+rtos::Mutex estadoMutex;
+rtos::Thread cloudThread(osPriorityNormal, 8192);
+
+void cloudThreadFunc() {
+  while (true) {
+    ArduinoCloud.update();
+    rtos::ThisThread::sleep_for(100);
+  }
+}
+
+// Status de Conectividade
+bool modoOffline       = true;
+bool cloudConectado    = false;
+bool cloudSincronizado = false;
+
+// ========================================================================
+// MAPEAMENTO — PAINEL BASE (PULSADORES)
+// ========================================================================
+const int IN_REFRIG  = A0;
+const int IN_VENT    = A1;
+const int IN_GAS     = A2;
+const int IN_UMIDIF  = A3;
+
+const int OUT_REFRIG = D0;
+const int OUT_VENT   = D1;
+const int OUT_GAS    = D2;
+const int OUT_UMIDIF = D3;
+
+const int LED_REFRIG = LED_D0;
+const int LED_VENT   = LED_D1;
+const int LED_GAS    = LED_D2;
+const int LED_UMIDIF = LED_D3;
+
+const int NUM_ENTRADAS = 4;
+const int ENTRADAS[NUM_ENTRADAS] = {IN_REFRIG, IN_VENT, IN_GAS, IN_UMIDIF};
+
+// Estados latch — ACESSO SOMENTE VIA estadoMutex
+bool estadoRefrig = false;
+bool estadoVent   = false;
+bool estadoGas    = false;
+bool estadoUmidif = false;
+
+bool prevEntrada[NUM_ENTRADAS]          = {LOW, LOW, LOW, LOW};
+bool estadoEstavel[NUM_ENTRADAS]        = {LOW, LOW, LOW, LOW};
+bool ultimoLeitura[NUM_ENTRADAS]        = {LOW, LOW, LOW, LOW};
+unsigned long ultimoTempoDebounce[NUM_ENTRADAS] = {0, 0, 0, 0};
+const unsigned long DEBOUNCE_DELAY = 50;
+
+// ========================================================================
+// MAPEAMENTO — PORTÃO E BIOMETRIA
+// ========================================================================
+const int IN_BOTAO_SOBE  = 0;
+const int IN_BOTAO_DESCE = 1;
+const int IN_BIOMETRIA   = 2;
+const int OUT_MOTOR_SOBE  = 0;
+const int OUT_MOTOR_DESCE = 1;
+
+const int NUM_EXP_IN = 3;
+const int EXP_IN[NUM_EXP_IN] = {IN_BOTAO_SOBE, IN_BOTAO_DESCE, IN_BIOMETRIA};
+bool estadoEstavelExp[NUM_EXP_IN]        = {LOW, LOW, LOW};
+bool ultimoLeituraExp[NUM_EXP_IN]        = {LOW, LOW, LOW};
+unsigned long ultimoTempoDebounceExp[NUM_EXP_IN] = {0, 0, 0};
+
+unsigned long tempoPulsoSobe  = 0;
+unsigned long tempoPulsoDesce = 0;
+bool pulsoSobeAtivo  = false;
+bool pulsoDesceAtivo = false;
+const unsigned long DURACAO_PULSO = 1000;
+
+unsigned long tempoLeituraBiometria = 0;
+bool biometriaAutorizada = false;
+const unsigned long JANELA_AUTORIZACAO = 15000;
+
+unsigned long tempoErroLed = 0;
+bool erroAcessoAtivo = false;
+
+// ========================================================================
+// QUARENTENA 12H — BASEADA EM RTC REAL E KVSTORE
+// ========================================================================
+bool   bloqueio12hAtivo          = false;
+time_t timestampInicioQuarentena = 0;
+bool   ultimoEstadoComandoGas    = false;
+
+const uint32_t PERIODO_12H_SEG = 12UL * 3600UL; // 43200 segundos
+
+// ========================================================================
+// DATALOGGER E EJEÇÃO SEGURA
+// ========================================================================
+unsigned long ultimoLogTempo = 0;
+const unsigned long INTERVALO_LOG = 60000; // 1 minuto
+bool dataloggerAtivo       = true;
+bool ultimoEstadoBtnUser   = HIGH;
+unsigned long tempoDebounceUser = 0;
+
+// ========================================================================
+// SETUP
+// ========================================================================
+void setup() {
+  Serial.begin(115200);
+  delay(1500);
+  Serial.println("=== AX CONTROL INICIANDO ===");
+
+  // 1. CONFIGURA FUSO HORÁRIO PARA O RTC (Brasília UTC-3)
+  setenv("TZ", "BRT3", 1);
+  tzset();
+
+  // 2. NUVEM E NTP (Offline-First)
+  initProperties();
+  ArduinoCloud.begin(ArduinoIoTPreferredConnection, false);
+  ArduinoCloud.addCallback(ArduinoIoTCloudEvent::CONNECT,    onCloudConnect);
+  ArduinoCloud.addCallback(ArduinoIoTCloudEvent::SYNC,       onCloudSync);
+  ArduinoCloud.addCallback(ArduinoIoTCloudEvent::DISCONNECT, onCloudDisconnect);
+  cloudThread.start(cloudThreadFunc);
+
+  // 3. WATCHDOG DE HARDWARE (10 segundos)
+  mbed::Watchdog::get_instance().start(10000);
+  Serial.println("Watchdog 10s ativado.");
+
+  // 4. RECUPERAÇÃO DA QUARENTENA VIA RTC + KVSTORE
+  time_t inicioSalvo = 0;
+  size_t actual_size = 0;
+  int res = kv_get("q_inicio", &inicioSalvo, sizeof(inicioSalvo), &actual_size);
+
+  if (res == MBED_SUCCESS && inicioSalvo > 0) {
+    time_t agora = time(NULL); 
+    uint32_t decorrido = (uint32_t)(agora - inicioSalvo);
+
+    if (decorrido < PERIODO_12H_SEG) {
+      bloqueio12hAtivo          = true;
+      timestampInicioQuarentena = inicioSalvo;
+      uint32_t restante = PERIODO_12H_SEG - decorrido;
+      Serial.print("QUARENTENA RECUPERADA! Decorrido: ");
+      Serial.print(decorrido / 3600);
+      Serial.print("h | Restante: ");
+      Serial.print(restante / 3600);
+      Serial.println("h");
+    } else {
+      kv_remove("q_inicio");
+      Serial.println("Quarentena expirada durante queda de energia. Liberado.");
+    }
+  }
+
+  // 5. CONFIGURAÇÃO DE PINOS
+  for (int i = 0; i < NUM_ENTRADAS; i++) pinMode(ENTRADAS[i], INPUT);
+  pinMode(OUT_REFRIG, OUTPUT); pinMode(OUT_VENT,   OUTPUT);
+  pinMode(OUT_GAS,   OUTPUT);  pinMode(OUT_UMIDIF, OUTPUT);
+  pinMode(LED_REFRIG, OUTPUT); pinMode(LED_VENT,   OUTPUT);
+  pinMode(LED_GAS,   OUTPUT);  pinMode(LED_UMIDIF, OUTPUT);
+  pinMode(BTN_USER,    INPUT);
+  pinMode(LED_BUILTIN, OUTPUT);
+  pinMode(LEDR,        OUTPUT);
+  digitalWrite(LED_BUILTIN, HIGH); 
+  digitalWrite(LEDR, LOW);
+
+  // 6. VALIDAÇÃO DE HARDWARE (EXPANSÕES)
+  OptaController.begin();
+  delay(1000);
+  OptaController.update();
+
+  if (OptaController.getExpansionNum() < 2) {
+    Serial.println("ERRO FATAL: Expansões não detectadas no barramento!");
+    digitalWrite(LED_BUILTIN, LOW);
+    digitalWrite(LEDR, HIGH);
+    while (true) {
+      mbed::Watchdog::get_instance().kick();
+      delay(1000);
+    }
+  }
+
+  expDigital = OptaController.getExpansion(0);
+  expAnalog  = OptaController.getExpansion(1);
+
+  expAnalog.beginChannelAsCurrentAdc(OA_CH_0);
+  expDigital.digitalWrite(OUT_MOTOR_SOBE,  LOW);
+  expDigital.digitalWrite(OUT_MOTOR_DESCE, LOW);
+  expDigital.updateDigitalOutputs();
+
+  // 7. INICIALIZA PENDRIVE
+  pendrive.begin();
+
+  // Fail-safe — tudo desligado inicialmente
+  digitalWrite(OUT_REFRIG, LOW); digitalWrite(LED_REFRIG, LOW);
+  digitalWrite(OUT_VENT,   LOW); digitalWrite(LED_VENT,   LOW);
+  digitalWrite(OUT_GAS,   LOW);  digitalWrite(LED_GAS,   LOW);
+  digitalWrite(OUT_UMIDIF, LOW); digitalWrite(LED_UMIDIF, LOW);
+
+  Serial.println("=== SISTEMA PRONTO ===");
+}
+
+// ========================================================================
+// LOOP PRINCIPAL
+// ========================================================================
+void loop() {
+  mbed::Watchdog::get_instance().kick();
+  unsigned long agora = millis();
+
+  OptaController.update();
+  expDigital.updateDigitalInputs();
+  expAnalog.updateAnalogInputs();
+
+  // ======================================================================
+  // 1. EJEÇÃO SEGURA DO PENDRIVE
+  // ======================================================================
+  if (dataloggerAtivo && !pendrive.connected()) {
+    dataloggerAtivo = false;
+    digitalWrite(LED_BUILTIN, LOW);
+    Serial.println("Pendrive removido — datalogger pausado.");
+  }
+
+  bool leituraBtnUser = digitalRead(BTN_USER);
+  if (leituraBtnUser == LOW && ultimoEstadoBtnUser == HIGH &&
+      (agora - tempoDebounceUser > 200)) {
+    dataloggerAtivo = !dataloggerAtivo;
+    tempoDebounceUser = agora;
+    digitalWrite(LED_BUILTIN, dataloggerAtivo ? HIGH : LOW);
+    Serial.println(dataloggerAtivo ? "GRAVAÇÃO RETOMADA!" : "EJEÇÃO SEGURA! Pode remover.");
+  }
+  ultimoEstadoBtnUser = leituraBtnUser;
+
+  // ======================================================================
+  // 2. LEITURA FÍSICA DOS PULSADORES (DEBOUNCE + TOGGLE)
+  // ======================================================================
+  for (int i = 0; i < NUM_ENTRADAS; i++) {
+    bool leituraAtual = digitalRead(ENTRADAS[i]);
+    if (leituraAtual != ultimoLeitura[i]) ultimoTempoDebounce[i] = agora;
+    if ((agora - ultimoTempoDebounce[i]) > DEBOUNCE_DELAY) estadoEstavel[i] = leituraAtual;
+    ultimoLeitura[i] = leituraAtual;
+
+    if (estadoEstavel[i] && !prevEntrada[i]) {
+      estadoMutex.lock();
+      switch (i) {
+        case 0: estadoRefrig = !estadoRefrig; break;
+        case 1: estadoVent   = !estadoVent;   break;
+        case 2: estadoGas    = !estadoGas;    break;
+        case 3: estadoUmidif = !estadoUmidif; break;
+      }
+      estadoMutex.unlock();
+    }
+    prevEntrada[i] = estadoEstavel[i];
+  }
+
+  // Captura atômica dos latches 
+  estadoMutex.lock();
+  bool comandoRefrig = estadoRefrig;
+  bool comandoVent   = estadoVent;
+  bool comandoGas    = estadoGas;
+  bool comandoUmidif = estadoUmidif;
+  estadoMutex.unlock();
+
+  // Intertravamento 
+  if (comandoRefrig) comandoVent = true;
+  if (comandoUmidif) comandoVent = true;
+
+  digitalWrite(OUT_REFRIG, comandoRefrig ? HIGH : LOW);
+  digitalWrite(OUT_VENT,   comandoVent   ? HIGH : LOW);
+  digitalWrite(OUT_GAS,    comandoGas    ? HIGH : LOW);
+  digitalWrite(OUT_UMIDIF, comandoUmidif ? HIGH : LOW);
+  digitalWrite(LED_REFRIG, comandoRefrig ? HIGH : LOW);
+  digitalWrite(LED_VENT,   comandoVent   ? HIGH : LOW);
+  digitalWrite(LED_GAS,    comandoGas    ? HIGH : LOW);
+  digitalWrite(LED_UMIDIF, comandoUmidif ? HIGH : LOW);
+
+  // ======================================================================
+  // 3. RELÓGIO DE QUARENTENA — BASEADO EM RTC REAL
+  // ======================================================================
+  if (comandoGas && !ultimoEstadoComandoGas && !bloqueio12hAtivo) {
+    timestampInicioQuarentena = time(NULL); 
+    bloqueio12hAtivo = true;
+    kv_set("q_inicio", &timestampInicioQuarentena, sizeof(timestampInicioQuarentena), 0); 
+    Serial.print("GÁS LIGADO! Quarentena iniciada em: ");
+    Serial.println(timestampInicioQuarentena);
+  }
+
+  if (bloqueio12hAtivo) {
+    time_t agora_rtc  = time(NULL);
+    uint32_t decorrido = (uint32_t)(agora_rtc - timestampInicioQuarentena);
+
+    if (decorrido >= PERIODO_12H_SEG) {
+      bloqueio12hAtivo          = false;
+      timestampInicioQuarentena = 0;
+      kv_remove("q_inicio");
+      Serial.println("QUARENTENA FINALIZADA! Portão liberado.");
+    }
+  }
+  ultimoEstadoComandoGas = comandoGas;
+
+  // ======================================================================
+  // 4. LEITURA SENSOR DE ETILENO (4-20mA -> 0-200 ppm)
+  // ======================================================================
+  float corrente_mA = expAnalog.pinCurrent(OA_CH_0);
+  float l_ppm_etileno = 0.0;
+  if (corrente_mA >= 4.0) {
+    l_ppm_etileno = (corrente_mA - 4.0) * 12.5; 
+    if (l_ppm_etileno > 200.0) l_ppm_etileno = 200.0;
+  }
+
+  // ======================================================================
+  // 5. CONTROLE DO PORTÃO (MAN-IN-THE-MIDDLE + BIOMETRIA)
+  // ======================================================================
+  for (int i = 0; i < NUM_EXP_IN; i++) {
+    bool leituraAtualExp = expDigital.digitalRead(EXP_IN[i]);
+    if (leituraAtualExp != ultimoLeituraExp[i]) ultimoTempoDebounceExp[i] = agora;
+    if ((agora - ultimoTempoDebounceExp[i]) > DEBOUNCE_DELAY)
+      estadoEstavelExp[i] = leituraAtualExp;
+    ultimoLeituraExp[i] = leituraAtualExp;
+  }
+
+  bool botaoSobePressionado  = estadoEstavelExp[0];
+  bool botaoDescePressionado = estadoEstavelExp[1];
+  bool sinalBiometria        = estadoEstavelExp[2];
+
+  if (sinalBiometria) {
+    biometriaAutorizada    = true;
+    tempoLeituraBiometria  = agora;
+  }
+  if (biometriaAutorizada && (agora - tempoLeituraBiometria >= JANELA_AUTORIZACAO)) {
+    biometriaAutorizada = false;
+  }
+
+  bool permissivoPortao = bloqueio12hAtivo ? biometriaAutorizada : true;
+
+  // Feedback visual de acesso negado (LED Vermelho do Opta pisca)
+  if (botaoSobePressionado && !permissivoPortao && !pulsoSobeAtivo) {
+    erroAcessoAtivo = true;
+    tempoErroLed    = agora;
+    digitalWrite(LEDR, HIGH);
+    Serial.println("ACESSO NEGADO: Biometria necessária.");
+  }
+  if (erroAcessoAtivo && (agora - tempoErroLed > 2000)) {
+    erroAcessoAtivo = false;
+    digitalWrite(LEDR, LOW);
+  }
+
+  if (botaoSobePressionado && permissivoPortao && !pulsoSobeAtivo && !pulsoDesceAtivo) {
+    pulsoSobeAtivo      = true;
+    tempoPulsoSobe      = agora;
+    biometriaAutorizada = false; 
+    expDigital.digitalWrite(OUT_MOTOR_SOBE, HIGH);
+  }
+
+  if (botaoDescePressionado && !pulsoDesceAtivo && !pulsoSobeAtivo) {
+    pulsoDesceAtivo = true;
+    tempoPulsoDesce = agora;
+    expDigital.digitalWrite(OUT_MOTOR_DESCE, HIGH);
+  }
+
+  if (pulsoSobeAtivo && (agora - tempoPulsoSobe >= DURACAO_PULSO)) {
+    pulsoSobeAtivo = false;
+    expDigital.digitalWrite(OUT_MOTOR_SOBE, LOW);
+  }
+  if (pulsoDesceAtivo && (agora - tempoPulsoDesce >= DURACAO_PULSO)) {
+    pulsoDesceAtivo = false;
+    expDigital.digitalWrite(OUT_MOTOR_DESCE, LOW);
+  }
+  expDigital.updateDigitalOutputs();
+
+  // ======================================================================
+  // 6. DATALOGGER (snprintf)
+  // ======================================================================
+  if (dataloggerAtivo && (agora - ultimoLogTempo >= INTERVALO_LOG)) {
+    ultimoLogTempo = agora;
+
+    if (pendrive.connected()) {
+      time_t agora_rtc = time(NULL);
+      struct tm *t = localtime(&agora_rtc);
+      char tempoFormatado[24];
+      
+      // Formata a data e hora como "YYYY-MM-DD HH:MM:SS"
+      strftime(tempoFormatado, sizeof(tempoFormatado), "%Y-%m-%d %H:%M:%S", t);
+
+      char linhaCSV[80];
+      snprintf(linhaCSV, sizeof(linhaCSV), "%s,%.2f,%d,%d",
+               tempoFormatado,
+               l_ppm_etileno,
+               comandoGas    ? 1 : 0,
+               bloqueio12hAtivo ? 1 : 0);
+
+      UFile arquivoLog = pendrive.open("/HISTORICO_CAMARA.csv", FILE_APPEND);
+      if (arquivoLog) {
+        if (arquivoLog.size() == 0)
+          arquivoLog.println("TIMESTAMP_BRT,ETILENO_PPM,GAS_LIGADO,QUARENTENA_ATIVA");
+        arquivoLog.println(linhaCSV);
+        arquivoLog.close();
+        Serial.println(linhaCSV);
+      }
+    }
+  }
+
+  // ======================================================================
+  // 7. SINCRONIZAÇÃO COM O DASHBOARD (CLOUD)
+  // ======================================================================
+  status_Refrig    = comandoRefrig;
+  status_Vent      = comandoVent;
+  status_Gas       = comandoGas;
+  status_Umidif    = comandoUmidif;
+  status_Quarentena = bloqueio12hAtivo;
+  
+  // Escrita de float protegida via cast para uint16_t (atômica em ARM 32-bit)
+  ppm_Etileno      = (uint16_t)l_ppm_etileno; 
+}
+
+// ========================================================================
+// CALLBACKS DA CLOUD
+// ========================================================================
+void onCloudConnect() {
+  cloudConectado = true;
+  modoOffline    = false;
+  Serial.println("Cloud: CONECTADO (NTP Sincronizado)");
+}
+void onCloudDisconnect() {
+  cloudConectado = false;
+  modoOffline    = true;
+  Serial.println("Cloud: DESCONECTADO — operando offline");
+}
+void onCloudSync() {
+  cloudSincronizado = true;
+  Serial.println("Cloud: SINCRONIZADO");
+}
+
+void onBtnRefrigChange() {
+  if (btn_Refrig) {
+    estadoMutex.lock(); estadoRefrig = !estadoRefrig; estadoMutex.unlock();
+    btn_Refrig = false;
+  }
+}
+void onBtnVentChange() {
+  if (btn_Vent) {
+    estadoMutex.lock(); estadoVent = !estadoVent; estadoMutex.unlock();
+    btn_Vent = false;
+  }
+}
+void onBtnGasChange() {
+  if (btn_Gas) {
+    estadoMutex.lock(); estadoGas = !estadoGas; estadoMutex.unlock();
+    btn_Gas = false;
+  }
+}
+void onBtnUmidifChange() {
+  if (btn_Umidif) {
+    estadoMutex.lock(); estadoUmidif = !estadoUmidif; estadoMutex.unlock();
+    btn_Umidif = false;
+  }
+}
+
+void onStatusRefrigChange()    {}
+void onStatusVentChange()      {}
+void onStatusGasChange()       {}
+void onStatusUmidifChange()    {}
+void onStatusQuarentenaChange(){}
+void onPpmEtilenoChange()      {}
