@@ -1,0 +1,104 @@
+#include <Arduino_Opta_Blueprint.h>
+
+DigitalMechExpansion expDigital; 
+
+// --- Mapeamento Expansão Digital ---
+const int IN_BOTAO_SOBE  = 0; // I1: Botão Físico Sobe
+const int IN_BOTAO_DESCE = 1; // I2: Botão Físico Desce
+const int IN_BIOMETRIA   = 2; // I3: Relé do Leitor Biométrico
+
+const int OUT_MOTOR_SOBE  = 0; // R1: Vai para a Placa
+const int OUT_MOTOR_DESCE = 1; // R2: Vai para a Placa
+
+// --- Variáveis de Pulso do Motor ---
+unsigned long tempoPulsoSobe = 0;
+unsigned long tempoPulsoDesce = 0;
+bool pulsoSobeAtivo = false;
+bool pulsoDesceAtivo = false;
+const unsigned long DURACAO_PULSO = 1000; // 1 seg para a placa
+
+// --- Variáveis da Janela Biométrica ---
+unsigned long tempoLeituraBiometria = 0;
+bool biometriaAutorizada = false;
+const unsigned long JANELA_AUTORIZACAO = 5000; // 5 segundos para apertar o botão após a digital
+
+void setup() {
+  // ... (suas configurações da Fase 1) ...
+  OptaController.begin(); 
+  delay(500); 
+  expDigital = OptaController.getExpansion(0); 
+
+  expDigital.digitalWrite(OUT_MOTOR_SOBE, LOW);
+  expDigital.digitalWrite(OUT_MOTOR_DESCE, LOW);
+  expDigital.updateDigitalOutputs();
+}
+
+void loop() {
+  unsigned long agora = millis();
+  
+  OptaController.update(); 
+  expDigital.updateDigitalInputs();
+
+  // ========================================================================
+  // LÓGICA DO LEITOR BIOMÉTRICO (Janela de Tempo)
+  // ========================================================================
+  bool sinalBiometria = expDigital.digitalRead(IN_BIOMETRIA);
+
+  // Se o leitor biométrico atracou o relé (Leu a digital)
+  if (sinalBiometria) {
+      biometriaAutorizada = true;
+      tempoLeituraBiometria = agora; // Reinicia o cronômetro dos 5 segundos
+  }
+
+  // Se o tempo da janela expirou, revoga a autorização
+  if (biometriaAutorizada && (agora - tempoLeituraBiometria >= JANELA_AUTORIZACAO)) {
+      biometriaAutorizada = false;
+  }
+
+  // ========================================================================
+  // LÓGICA DO PORTÃO (MAN-IN-THE-MIDDLE)
+  // ========================================================================
+  bool botaoSobePressionado  = expDigital.digitalRead(IN_BOTAO_SOBE);
+  bool botaoDescePressionado = expDigital.digitalRead(IN_BOTAO_DESCE);
+  
+  // Condição para Bloqueio: Verifica se o gás está ligado na máquina
+  // (Assumindo que 'comandoGas' é a sua variável atual que liga o Etileno)
+  bool cicloGasAtivo = comandoGas; 
+  
+  // O permissivo é verdadeiro por padrão. Mas SE o gás estiver ligado, 
+  // ele passa a exigir a biometria autorizada.
+  bool permissivoPortao = true; 
+  if (cicloGasAtivo) {
+      permissivoPortao = biometriaAutorizada;
+  }
+
+  // ABRIR: Só abre se o operador apertar E tiver o permissivo validado
+  if (botaoSobePressionado && permissivoPortao && !pulsoSobeAtivo) {
+      pulsoSobeAtivo = true;
+      tempoPulsoSobe = agora;
+      expDigital.digitalWrite(OUT_MOTOR_SOBE, HIGH); 
+      
+      // Opcional: "Gasta" a autorização para obrigar a ler a digital de novo no próximo uso
+      biometriaAutorizada = false; 
+  }
+
+  // FECHAR: Fechar geralmente é seguro, então não costuma exigir biometria.
+  // Se quiser exigir, basta adicionar o && permissivoPortao aqui também.
+  if (botaoDescePressionado && !pulsoDesceAtivo) {
+      pulsoDesceAtivo = true;
+      tempoPulsoDesce = agora;
+      expDigital.digitalWrite(OUT_MOTOR_DESCE, HIGH); 
+  }
+
+  // --- Desligamento dos Pulsos (Dedo Virtual) ---
+  if (pulsoSobeAtivo && (agora - tempoPulsoSobe >= DURACAO_PULSO)) {
+      pulsoSobeAtivo = false;
+      expDigital.digitalWrite(OUT_MOTOR_SOBE, LOW);
+  }
+  if (pulsoDesceAtivo && (agora - tempoPulsoDesce >= DURACAO_PULSO)) {
+      pulsoDesceAtivo = false;
+      expDigital.digitalWrite(OUT_MOTOR_DESCE, LOW);
+  }
+
+  expDigital.updateDigitalOutputs();
+}
