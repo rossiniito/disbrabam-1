@@ -1,0 +1,364 @@
+/*
+  ======================================================================
+  AX CONTROL - VERSÃO MASTER DEFINITIVA
+  - Quarentena: 12h (Sr. Raimundo) com Persistência em Flash (KVStore)
+  - Intertravamento: Portão Biométrico e Motor (Sobe/Desce)
+  - Feedback Visual: LED Vermelho para Acesso Negado
+  ======================================================================
+*/
+
+#include <Arduino.h>
+#include <Arduino_Opta_Blueprint.h>
+#include <Arduino_UnifiedStorage.h> 
+#include <mbed.h>
+#include <drivers/Watchdog.h>
+#include <kvstore_global_api.h> // API de Memória Flash Interna
+
+// ========================================================================
+// INSTÂNCIAS DE HARDWARE
+// ========================================================================
+DigitalMechExpansion expDigital; 
+AnalogExpansion      expAnalog;
+USBStorage           pendrive;
+
+// ========================================================================
+// MAPEAMENTO (PAINEL BASE - PULSADORES DO WILSON)
+// ========================================================================
+const int IN_REFRIG  = A0; 
+const int IN_VENT    = A1; 
+const int IN_GAS     = A2; 
+const int IN_UMIDIF  = A3; 
+
+const int OUT_REFRIG = D0; 
+const int OUT_VENT   = D1; 
+const int OUT_GAS    = D2; 
+const int OUT_UMIDIF = D3; 
+
+const int LED_REFRIG = LED_D0;
+const int LED_VENT   = LED_D1;
+const int LED_GAS    = LED_D2;
+const int LED_UMIDIF = LED_D3;
+
+const int NUM_ENTRADAS = 4;
+const int ENTRADAS[NUM_ENTRADAS] = {IN_REFRIG, IN_VENT, IN_GAS, IN_UMIDIF}; 
+
+// Memória do Selo Eletrônico
+bool estadoRefrig = false;
+bool estadoVent   = false;
+bool estadoGas    = false;
+bool estadoUmidif = false;
+bool prevEntrada[NUM_ENTRADAS] = {LOW, LOW, LOW, LOW};
+
+// Debounce Base
+const unsigned long DEBOUNCE_DELAY = 50;
+bool estadoEstavel[NUM_ENTRADAS] = {LOW, LOW, LOW, LOW};
+bool ultimoLeitura[NUM_ENTRADAS] = {LOW, LOW, LOW, LOW};
+unsigned long ultimoTempoDebounce[NUM_ENTRADAS] = {0, 0, 0, 0};
+
+// ========================================================================
+// MAPEAMENTO (PORTÃO E BIOMETRIA)
+// ========================================================================
+const int IN_BOTAO_SOBE  = 0; 
+const int IN_BOTAO_DESCE = 1; 
+const int IN_BIOMETRIA   = 2; 
+
+const int OUT_MOTOR_SOBE  = 0; 
+const int OUT_MOTOR_DESCE = 1; 
+
+const int NUM_EXP_IN = 3;
+const int EXP_IN[NUM_EXP_IN] = {IN_BOTAO_SOBE, IN_BOTAO_DESCE, IN_BIOMETRIA};
+bool estadoEstavelExp[NUM_EXP_IN] = {LOW, LOW, LOW};
+bool ultimoLeituraExp[NUM_EXP_IN] = {LOW, LOW, LOW};
+unsigned long ultimoTempoDebounceExp[NUM_EXP_IN] = {0, 0, 0};
+
+unsigned long tempoPulsoSobe = 0;
+unsigned long tempoPulsoDesce = 0;
+bool pulsoSobeAtivo = false;
+bool pulsoDesceAtivo = false;
+const unsigned long DURACAO_PULSO = 1000; 
+
+unsigned long tempoLeituraBiometria = 0;
+bool biometriaAutorizada = false;
+const unsigned long JANELA_AUTORIZACAO = 15000; // 15 Segundos
+
+unsigned long tempoErroLed = 0;
+bool erroAcessoAtivo = false;
+
+// ========================================================================
+// CONTROLE DE QUARENTENA E MEMÓRIA FLASH (12 HORAS DO ETILENO)
+// ========================================================================
+bool bloqueio12hAtivo = false;
+uint32_t tempoDecorridoQuarentena = 0; // Acumulador em milissegundos
+unsigned long ultimoTickQuarentena = 0;
+unsigned long ultimoSaveFlash = 0;
+
+const uint32_t PERIODO_12H = 43200000UL; // 12 horas cravadas (Sr. Raimundo)
+const unsigned long INTERVALO_SAVE_FLASH = 300000; // Salva na Flash a cada 5 minutos
+bool ultimoEstadoComandoGas = false;
+
+// ========================================================================
+// DATALOGGER E EJEÇÃO SEGURA (CRIS)
+// ========================================================================
+unsigned long ultimoLogTempo = 0;
+const unsigned long INTERVALO_LOG = 60000; // 1 Minuto
+
+bool dataloggerAtivo = true; 
+bool ultimoEstadoBtnUser = HIGH; 
+unsigned long tempoDebounceUser = 0;
+
+void setup() {
+  Serial.begin(115200);
+  delay(1500);
+
+  // 1. WATCHDOG (10 Segundos)
+  mbed::Watchdog::get_instance().start(10000);
+  Serial.println("Watchdog Ativado.");
+
+  // 2. RECUPERAÇÃO DA MEMÓRIA FLASH INTERNA
+  size_t actual_size = 0;
+  int res = kv_get("q_tempo", &tempoDecorridoQuarentena, sizeof(tempoDecorridoQuarentena), &actual_size);
+  if (res == MBED_SUCCESS && tempoDecorridoQuarentena > 0 && tempoDecorridoQuarentena < PERIODO_12H) {
+      bloqueio12hAtivo = true;
+      Serial.print("⚡ RECUPERAÇÃO DE QUARENTENA DA FLASH! Retomando de: ");
+      Serial.print(tempoDecorridoQuarentena / 60000);
+      Serial.println(" minutos.");
+  } else {
+      tempoDecorridoQuarentena = 0; // Se houver lixo ou já tiver cumprido, zera.
+  }
+  ultimoTickQuarentena = millis();
+
+  // 3. CONFIGURAÇÃO BASE
+  for (int i = 0; i < NUM_ENTRADAS; i++) pinMode(ENTRADAS[i], INPUT);
+  pinMode(OUT_REFRIG, OUTPUT); pinMode(OUT_VENT, OUTPUT);
+  pinMode(OUT_GAS, OUTPUT);    pinMode(OUT_UMIDIF, OUTPUT);
+  pinMode(LED_REFRIG, OUTPUT); pinMode(LED_VENT, OUTPUT);
+  pinMode(LED_GAS, OUTPUT);    pinMode(LED_UMIDIF, OUTPUT);
+  
+  pinMode(BTN_USER, INPUT); 
+  pinMode(LED_BUILTIN, OUTPUT); // Verde
+  pinMode(LEDR, OUTPUT);        // Vermelho
+  digitalWrite(LED_BUILTIN, HIGH); 
+  digitalWrite(LEDR, LOW); 
+
+  // 4. VALIDAÇÃO DE HARDWARE
+  OptaController.begin();
+  delay(1000); 
+  OptaController.update();
+
+  if (OptaController.getExpansionNum() < 2) {
+      Serial.println("ERRO FATAL: Expansões não detectadas!");
+      digitalWrite(LED_BUILTIN, LOW); 
+      digitalWrite(LEDR, HIGH); 
+      while (true) { mbed::Watchdog::get_instance().kick(); delay(1000); } 
+  }
+
+  expDigital = OptaController.getExpansion(0); 
+  expAnalog  = OptaController.getExpansion(1);
+
+  expAnalog.beginChannelAsCurrentAdc(OA_CH_0); 
+  expDigital.digitalWrite(OUT_MOTOR_SOBE, LOW);
+  expDigital.digitalWrite(OUT_MOTOR_DESCE, LOW);
+  expDigital.updateDigitalOutputs();
+
+  pendrive.begin();
+}
+
+void loop() {
+  mbed::Watchdog::get_instance().kick(); 
+  unsigned long agora = millis();
+  
+  OptaController.update();
+  expDigital.updateDigitalInputs();
+  expAnalog.updateAnalogInputs();
+
+  // ========================================================================
+  // 1. EJEÇÃO SEGURA DO PENDRIVE
+  // ========================================================================
+  if (dataloggerAtivo && !pendrive.connected()) {
+      dataloggerAtivo = false; 
+      digitalWrite(LED_BUILTIN, LOW);
+  }
+
+  bool leituraBtnUser = digitalRead(BTN_USER);
+  if (leituraBtnUser == LOW && ultimoEstadoBtnUser == HIGH && (agora - tempoDebounceUser > 200)) {
+      dataloggerAtivo = !dataloggerAtivo; 
+      tempoDebounceUser = agora;
+      digitalWrite(LED_BUILTIN, dataloggerAtivo ? HIGH : LOW); 
+      if (!dataloggerAtivo) Serial.println("EJEÇÃO SEGURA! Pode remover.");
+      else Serial.println("GRAVAÇÃO RETOMADA!");
+  }
+  ultimoEstadoBtnUser = leituraBtnUser;
+
+  // ========================================================================
+  // 2. LÓGICA DO PAINEL BASE (PULSADORES NA)
+  // ========================================================================
+  for (int i = 0; i < NUM_ENTRADAS; i++) {
+    bool leituraAtual = digitalRead(ENTRADAS[i]);
+    if (leituraAtual != ultimoLeitura[i]) ultimoTempoDebounce[i] = agora;
+    if ((agora - ultimoTempoDebounce[i]) > DEBOUNCE_DELAY) estadoEstavel[i] = leituraAtual;
+    ultimoLeitura[i] = leituraAtual;
+
+    bool entrada = estadoEstavel[i];
+    if (entrada && !prevEntrada[i]) { 
+      switch (i) {
+        case 0: estadoRefrig = !estadoRefrig; break;
+        case 1: estadoVent   = !estadoVent;   break;
+        case 2: estadoGas    = !estadoGas;    break;
+        case 3: estadoUmidif = !estadoUmidif; break;
+      }
+    }
+    prevEntrada[i] = entrada; 
+  }
+
+  bool comandoRefrig = estadoRefrig;
+  bool comandoVent   = estadoVent;
+  bool comandoGas    = estadoGas;
+  bool comandoUmidif = estadoUmidif;
+
+  if (comandoRefrig) comandoVent = true; 
+  if (comandoUmidif) comandoVent = true;
+
+  digitalWrite(OUT_REFRIG, comandoRefrig ? HIGH : LOW);
+  digitalWrite(OUT_VENT,   comandoVent   ? HIGH : LOW);
+  digitalWrite(OUT_GAS,    comandoGas    ? HIGH : LOW);
+  digitalWrite(OUT_UMIDIF, comandoUmidif ? HIGH : LOW);
+  digitalWrite(LED_REFRIG, comandoRefrig ? HIGH : LOW);
+  digitalWrite(LED_VENT,   comandoVent   ? HIGH : LOW);
+  digitalWrite(LED_GAS,    comandoGas    ? HIGH : LOW);
+  digitalWrite(LED_UMIDIF, comandoUmidif ? HIGH : LOW);
+
+  // ========================================================================
+  // 3. O RELÓGIO DE QUARENTENA CUMULATIVO (FLASH)
+  // ========================================================================
+  if (comandoGas && !ultimoEstadoComandoGas) { // Iniciou o Gás agora
+      bloqueio12hAtivo = true;
+      tempoDecorridoQuarentena = 0; // Zera qualquer quarentena antiga
+      ultimoTickQuarentena = agora;
+      kv_set("q_tempo", &tempoDecorridoQuarentena, sizeof(tempoDecorridoQuarentena), 0);
+      Serial.println("GÁS LIGADO! Quarentena de 12h Iniciada e Gravada na Flash.");
+  }
+  
+  if (bloqueio12hAtivo) {
+      unsigned long delta = agora - ultimoTickQuarentena;
+      ultimoTickQuarentena = agora;
+      tempoDecorridoQuarentena += delta; // Acumula o tempo rodando
+
+      // A cada 5 minutos, escreve o progresso na memória Flash
+      if (agora - ultimoSaveFlash >= INTERVALO_SAVE_FLASH) {
+          kv_set("q_tempo", &tempoDecorridoQuarentena, sizeof(tempoDecorridoQuarentena), 0);
+          ultimoSaveFlash = agora;
+          Serial.println("Progresso da Quarentena Salvo na Flash Segura.");
+      }
+
+      // Se as 12h já se passaram
+      if (tempoDecorridoQuarentena >= PERIODO_12H) {
+          bloqueio12hAtivo = false;
+          tempoDecorridoQuarentena = 0;
+          kv_set("q_tempo", &tempoDecorridoQuarentena, sizeof(tempoDecorridoQuarentena), 0);
+          Serial.println("QUARENTENA DE 12H CONCLUÍDA! Portão liberado.");
+      }
+  }
+  ultimoEstadoComandoGas = comandoGas;
+
+  // ========================================================================
+  // 4. LEITURA SENSOR DE ETILENO (0-200 ppm)
+  // ========================================================================
+  float corrente_mA = expAnalog.pinCurrent(OA_CH_0);
+  float ppm_etileno = 0.0;
+  if (corrente_mA >= 4.0) {
+    ppm_etileno = (corrente_mA - 4.0) * 12.5; 
+    if (ppm_etileno > 200.0) ppm_etileno = 200.0; 
+  }
+
+  // ========================================================================
+  // 5. CONTROLE DO PORTÃO (MAN-IN-THE-MIDDLE) E FEEDBACK DE ERRO
+  // ========================================================================
+  for (int i = 0; i < NUM_EXP_IN; i++) {
+    bool leituraAtualExp = expDigital.digitalRead(EXP_IN[i]);
+    if (leituraAtualExp != ultimoLeituraExp[i]) ultimoTempoDebounceExp[i] = agora;
+    if ((agora - ultimoTempoDebounceExp[i]) > DEBOUNCE_DELAY) estadoEstavelExp[i] = leituraAtualExp;
+    ultimoLeituraExp[i] = leituraAtualExp;
+  }
+
+  bool botaoSobePressionado  = estadoEstavelExp[0];
+  bool botaoDescePressionado = estadoEstavelExp[1];
+  bool sinalBiometria        = estadoEstavelExp[2];
+
+  if (sinalBiometria) {
+      biometriaAutorizada = true;
+      tempoLeituraBiometria = agora;
+      Serial.println("BIOMETRIA LIDA! Você tem 15s para abrir o portão.");
+  }
+  if (biometriaAutorizada && (agora - tempoLeituraBiometria >= JANELA_AUTORIZACAO)) {
+      biometriaAutorizada = false;
+  }
+
+  // PERMISSIVO: Se estiver nas 12h de quarentena, EXIGE biometria.
+  bool permissivoPortao = bloqueio12hAtivo ? biometriaAutorizada : true;
+
+  // TENTOU ABRIR SEM PERMISSÃO DURANTE A QUARENTENA
+  if (botaoSobePressionado && !permissivoPortao && !pulsoSobeAtivo) {
+      erroAcessoAtivo = true;
+      tempoErroLed = agora;
+      digitalWrite(LEDR, HIGH); // Acende o LED Vermelho de Alerta
+      Serial.println("ACESSO NEGADO: Biometria necessária durante as 12h!");
+  }
+
+  // APAGA O LED VERMELHO APÓS 2 SEGUNDOS
+  if (erroAcessoAtivo && (agora - tempoErroLed > 2000)) {
+      erroAcessoAtivo = false;
+      digitalWrite(LEDR, LOW);
+  }
+
+  // ABRIR PORTÃO (Com permissão)
+  if (botaoSobePressionado && permissivoPortao && !pulsoSobeAtivo && !pulsoDesceAtivo) {
+      pulsoSobeAtivo = true;
+      tempoPulsoSobe = agora;
+      expDigital.digitalWrite(OUT_MOTOR_SOBE, HIGH); 
+      biometriaAutorizada = false; 
+  }
+  
+  // FECHAR PORTÃO
+  if (botaoDescePressionado && !pulsoDesceAtivo && !pulsoSobeAtivo) {
+      pulsoDesceAtivo = true;
+      tempoPulsoDesce = agora;
+      expDigital.digitalWrite(OUT_MOTOR_DESCE, HIGH); 
+  }
+
+  if (pulsoSobeAtivo && (agora - tempoPulsoSobe >= DURACAO_PULSO)) {
+      pulsoSobeAtivo = false;
+      expDigital.digitalWrite(OUT_MOTOR_SOBE, LOW);
+  }
+  if (pulsoDesceAtivo && (agora - tempoPulsoDesce >= DURACAO_PULSO)) {
+      pulsoDesceAtivo = false;
+      expDigital.digitalWrite(OUT_MOTOR_DESCE, LOW);
+  }
+  expDigital.updateDigitalOutputs();
+
+  // ========================================================================
+  // 6. DATALOGGER AVANÇADO 
+  // ========================================================================
+  if (dataloggerAtivo && (agora - ultimoLogTempo >= INTERVALO_LOG)) {
+    ultimoLogTempo = agora;
+    
+    if (pendrive.connected()) {
+      unsigned long totalSegundos = agora / 1000;
+      unsigned long dias = totalSegundos / 86400;
+      unsigned long horas = (totalSegundos % 86400) / 3600;
+      unsigned long minutos = (totalSegundos % 3600) / 60;
+      unsigned long segundos = totalSegundos % 60;
+      
+      String tempoFormatado = String(dias) + "d:" + String(horas) + "h:" + String(minutos) + "m:" + String(segundos) + "s";
+      String linhaCSV = tempoFormatado + "," + String(ppm_etileno, 2) + "," + String(comandoGas ? 1 : 0) + "," + String(bloqueio12hAtivo ? 1 : 0);
+      
+      UFile arquivoLog = pendrive.open("/HISTORICO_CAMARA.csv", FILE_APPEND);
+      if (arquivoLog) {
+        if (arquivoLog.size() == 0) {
+            arquivoLog.println("TEMPO_ATIVO,ETILENO_PPM,GAS_LIGADO,QUARENTENA_12H_ATIVA");
+        }
+        arquivoLog.println(linhaCSV);
+        arquivoLog.close(); 
+      }
+    }
+  }
+}
