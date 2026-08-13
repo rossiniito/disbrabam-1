@@ -1,0 +1,348 @@
+/*
+  ======================================================================
+  AX CONTROL - DISBRABAM (VERSÃO FINAL COMPLETA)
+  - Botões pulsadores físicos (toggle liga/desliga)
+  - Intertravamento de ventilação (refrigeração e umidificador forçam vent)
+  - Leitura de sensor de etileno 4-20mA (expansão analógica)
+  - Arduino IoT Cloud com offline-first (thread dedicada)
+  - Watchdog de hardware (10s)
+  - LEDs do painel sincronizados com relés
+  - Mutex para proteção de estados (thread cloud vs loop físico)
+  - Validação de expansões no boot
+  - Sincronização bidirecional: toggle do app reflete painel e vice-versa
+  ======================================================================
+*/
+
+#include "thingProperties.h"
+#include <Arduino.h>
+#include "OptaBlue.h"
+#include <rtos.h>
+#include <mbed.h>
+#include <drivers/Watchdog.h>
+
+// --- INSTÂNCIAS DAS EXPANSÕES ---
+DigitalMechExpansion expDigital;
+AnalogExpansion      expAnalog;
+
+// --- MAPEAMENTO DE ENTRADAS ---
+const int IN_REFRIG  = A0;
+const int IN_VENT    = A1;
+const int IN_GAS     = A2;
+const int IN_UMIDIF  = A3;
+
+// --- MAPEAMENTO DE SAÍDAS (Relés Físicos) ---
+const int OUT_REFRIG = D0;
+const int OUT_VENT   = D1;
+const int OUT_GAS    = D2;
+const int OUT_UMIDIF = D3;
+
+// --- MAPEAMENTO DE SAÍDAS (LEDs do Painel Frontal) ---
+const int LED_REFRIG = LED_D0;
+const int LED_VENT   = LED_D1;
+const int LED_GAS    = LED_D2;
+const int LED_UMIDIF = LED_D3;
+
+// --- CONFIGURAÇÃO DE DEBOUNCE ANTI-RUÍDO ---
+const int NUM_ENTRADAS = 4;
+const int ENTRADAS[NUM_ENTRADAS] = {IN_REFRIG, IN_VENT, IN_GAS, IN_UMIDIF};
+const unsigned long DEBOUNCE_DELAY = 50;
+bool estadoEstavel[NUM_ENTRADAS] = {LOW, LOW, LOW, LOW};
+bool ultimoLeitura[NUM_ENTRADAS] = {LOW, LOW, LOW, LOW};
+unsigned long ultimoTempoDebounce[NUM_ENTRADAS] = {0, 0, 0, 0};
+bool prevEntrada[NUM_ENTRADAS] = {LOW, LOW, LOW, LOW};
+
+// --- ESTADOS LATCH (compartilhados entre painel e cloud) ---
+bool estadoRefrig = false;
+bool estadoVent   = false;
+bool estadoGas    = false;
+bool estadoUmidif = false;
+
+// --- MUTEX PARA PROTEÇÃO CONCORRÊNCIA ---
+rtos::Mutex estadoMutex;
+
+// --- CONTROLE DE MODO OFFLINE / CONECTIVIDADE ---
+bool modoOffline = true;
+bool cloudConectado = false;
+bool cloudSincronizado = false;
+
+// Declarações antecipadas
+void onCloudConnect();
+void onCloudSync();
+void onCloudDisconnect();
+void verificarStatusConectividade();
+
+// ========================================================================
+// THREAD PARA ArduinoCloud (Offline-First)
+// ========================================================================
+rtos::Thread cloudThread(osPriorityNormal, 8192);
+
+void cloudThreadFunc() {
+  while (true) {
+    ArduinoCloud.update();
+    rtos::ThisThread::sleep_for(20);
+  }
+}
+
+void aplicarIntertravamento() {
+  if (estadoRefrig) {
+    estadoVent = true;
+  }
+  if (estadoUmidif) {
+    estadoVent = true;
+  }
+}
+
+// ========================================================================
+// SETUP
+// ========================================================================
+void setup() {
+  Serial.begin(9600);
+  delay(1500);
+
+  initProperties();
+  ArduinoCloud.begin(ArduinoIoTPreferredConnection, false);
+
+  ArduinoCloud.addCallback(ArduinoIoTCloudEvent::CONNECT, onCloudConnect);
+  ArduinoCloud.addCallback(ArduinoIoTCloudEvent::SYNC, onCloudSync);
+  ArduinoCloud.addCallback(ArduinoIoTCloudEvent::DISCONNECT, onCloudDisconnect);
+
+  modoOffline = true;
+  cloudConectado = false;
+  cloudSincronizado = false;
+
+  setDebugMessageLevel(0);
+  ArduinoCloud.printDebugInfo();
+
+  cloudThread.start(cloudThreadFunc);
+  delay(100);
+
+  // --- WATCHDOG DE HARDWARE (10 segundos) ---
+  bool wdg_iniciado = mbed::Watchdog::get_instance().start(10000);
+  if (wdg_iniciado) {
+    Serial.println("Watchdog ativado com sucesso.");
+  }
+
+  // --- INICIALIZAÇÃO DAS EXPANSÕES OPTA ---
+  OptaController.begin();
+  delay(1000);
+  OptaController.update();
+
+  if (OptaController.getExpansionNum() < 2) {
+    Serial.println("ERRO FATAL: Expansoes nao detectadas!");
+    pinMode(LEDR, OUTPUT);
+    digitalWrite(LEDR, HIGH);
+    while (true) {
+      mbed::Watchdog::get_instance().kick();
+      delay(1000);
+    }
+  }
+
+  expDigital = OptaController.getExpansion(0);
+  expAnalog  = OptaController.getExpansion(1);
+  expAnalog.beginChannelAsCurrentAdc(OA_CH_0);
+
+  // --- CONFIGURAÇÃO DAS ENTRADAS ---
+  for (int i = 0; i < NUM_ENTRADAS; i++) {
+    pinMode(ENTRADAS[i], INPUT);
+  }
+
+  // --- CONFIGURAÇÃO DOS RELÉS ---
+  pinMode(OUT_REFRIG, OUTPUT);
+  pinMode(OUT_VENT, OUTPUT);
+  pinMode(OUT_GAS, OUTPUT);
+  pinMode(OUT_UMIDIF, OUTPUT);
+
+  // --- CONFIGURAÇÃO DOS LEDs ---
+  pinMode(LED_REFRIG, OUTPUT);
+  pinMode(LED_VENT, OUTPUT);
+  pinMode(LED_GAS, OUTPUT);
+  pinMode(LED_UMIDIF, OUTPUT);
+
+  // --- BOOT SEGURO: TUDO DESLIGADO ---
+  digitalWrite(OUT_REFRIG, LOW); digitalWrite(LED_REFRIG, LOW);
+  digitalWrite(OUT_VENT, LOW);   digitalWrite(LED_VENT, LOW);
+  digitalWrite(OUT_GAS, LOW);    digitalWrite(LED_GAS, LOW);
+  digitalWrite(OUT_UMIDIF, LOW); digitalWrite(LED_UMIDIF, LOW);
+}
+
+// ========================================================================
+// LOOP PRINCIPAL
+// ========================================================================
+void loop() {
+  mbed::Watchdog::get_instance().kick();
+
+  static unsigned long ultimaVerificacao = 0;
+  if ((millis() - ultimaVerificacao) >= 10000) {
+    verificarStatusConectividade();
+    ultimaVerificacao = millis();
+  }
+
+  unsigned long agora = millis();
+
+  OptaController.update();
+  expAnalog.updateAnalogInputs();
+
+  // ========================================================================
+  // 1. LEITURA SENSOR DE ETILENO (4-20mA -> 0-200 ppm)
+  // ========================================================================
+  float corrente_mA = expAnalog.pinCurrent(OA_CH_0);
+  float ppm_calculado = 0.0;
+
+  if (corrente_mA >= 4.0) {
+    ppm_calculado = (corrente_mA - 4.0) * 12.5;
+    if (ppm_calculado > 200.0) ppm_calculado = 200.0;
+  }
+
+  leitura_Etil = ppm_calculado;
+
+  // ========================================================================
+  // 2. LEITURA FÍSICA DAS ENTRADAS (DEBOUNCE)
+  // ========================================================================
+  for (int i = 0; i < NUM_ENTRADAS; i++) {
+    bool leituraAtual = digitalRead(ENTRADAS[i]);
+
+    if (leituraAtual != ultimoLeitura[i]) {
+      ultimoTempoDebounce[i] = agora;
+    }
+
+    if ((agora - ultimoTempoDebounce[i]) > DEBOUNCE_DELAY) {
+      estadoEstavel[i] = leituraAtual;
+    }
+
+    ultimoLeitura[i] = leituraAtual;
+  }
+
+  // ========================================================================
+  // 3. PULSOS FÍSICOS -> TOGGLE DOS ESTADOS (BORDA DE SUBIDA)
+  // ========================================================================
+  for (int i = 0; i < NUM_ENTRADAS; i++) {
+    bool entrada = estadoEstavel[i];
+
+    if (entrada && !prevEntrada[i]) {
+      estadoMutex.lock();
+      switch (i) {
+        case 0: estadoRefrig = !estadoRefrig; break;
+        case 1: estadoVent   = !estadoVent;   break;
+        case 2: estadoGas    = !estadoGas;    break;
+        case 3: estadoUmidif = !estadoUmidif; break;
+      }
+      estadoMutex.unlock();
+    }
+
+    prevEntrada[i] = entrada;
+  }
+
+  // ========================================================================
+  // 4. INTERTRAVAMENTO INDUSTRIAL
+  // ========================================================================
+  estadoMutex.lock();
+  aplicarIntertravamento();
+
+  bool saidaRefrig = estadoRefrig;
+  bool saidaVent   = estadoVent;
+  bool saidaGas    = estadoGas;
+  bool saidaUmidif = estadoUmidif;
+  estadoMutex.unlock();
+
+  // ========================================================================
+  // 5. SINCRONIZAÇÃO COMPLETA COM A CLOUD (1x por segundo)
+  //    Status + Toggles espelham o estado real do hardware
+  // ========================================================================
+  static unsigned long ultimoStatusCloud = 0;
+  if ((agora - ultimoStatusCloud) >= 1000) {
+    status_Refrig = saidaRefrig;
+    status_Vent   = saidaVent;
+    status_Gas    = saidaGas;
+    status_Umidif = saidaUmidif;
+
+    btn_Refrig = saidaRefrig;
+    btn_Vent   = saidaVent;
+    btn_Gas    = saidaGas;
+    btn_Umidif = saidaUmidif;
+
+    ultimoStatusCloud = agora;
+  }
+
+  // ========================================================================
+  // 6. ACIONAMENTO DE POTÊNCIA (RELÉS FÍSICOS)
+  // ========================================================================
+  digitalWrite(OUT_REFRIG, saidaRefrig ? HIGH : LOW);
+  digitalWrite(OUT_VENT,   saidaVent   ? HIGH : LOW);
+  digitalWrite(OUT_GAS,    saidaGas    ? HIGH : LOW);
+  digitalWrite(OUT_UMIDIF, saidaUmidif ? HIGH : LOW);
+
+  // ========================================================================
+  // 7. ACIONAMENTO VISUAL (LEDs DO PAINEL)
+  // ========================================================================
+  digitalWrite(LED_REFRIG, saidaRefrig ? HIGH : LOW);
+  digitalWrite(LED_VENT,   saidaVent   ? HIGH : LOW);
+  digitalWrite(LED_GAS,    saidaGas    ? HIGH : LOW);
+  digitalWrite(LED_UMIDIF, saidaUmidif ? HIGH : LOW);
+}
+
+// ========================================================================
+// CONECTIVIDADE E CALLBACKS DA CLOUD
+// ========================================================================
+void verificarStatusConectividade() {
+  bool agoraConectado = ArduinoCloud.connected();
+
+  if (agoraConectado && !cloudConectado) {
+    onCloudConnect();
+  } else if (!agoraConectado && cloudConectado) {
+    onCloudDisconnect();
+  }
+}
+
+void onCloudConnect() {
+  cloudConectado = true;
+  modoOffline = false;
+  cloudSincronizado = false;
+}
+
+void onCloudSync() {
+  cloudSincronizado = true;
+}
+
+void onCloudDisconnect() {
+  cloudConectado = false;
+  cloudSincronizado = false;
+  modoOffline = true;
+}
+
+// ========================================================================
+// CALLBACKS DOS BOTÕES VIRTUAIS (APP)
+// O toggle do app envia true/false diretamente como estado desejado.
+// O loop sincroniza btn_* de volta 1x por segundo com o estado real.
+// ========================================================================
+void onBtnGasChange() {
+  estadoMutex.lock();
+  estadoGas = btn_Gas;
+  estadoMutex.unlock();
+}
+
+void onBtnRefrigChange() {
+  estadoMutex.lock();
+  estadoRefrig = btn_Refrig;
+  estadoMutex.unlock();
+}
+
+void onBtnUmidifChange() {
+  estadoMutex.lock();
+  estadoUmidif = btn_Umidif;
+  estadoMutex.unlock();
+}
+
+void onBtnVentChange() {
+  estadoMutex.lock();
+  estadoVent = btn_Vent;
+  estadoMutex.unlock();
+}
+
+// ========================================================================
+// CALLBACKS VAZIOS (variáveis read-only)
+// ========================================================================
+void onLeituraEtilChange() {}
+void onStatusGasChange() {}
+void onStatusRefrigChange() {}
+void onStatusUmidifChange() {}
+void onStatusVentChange() {}
