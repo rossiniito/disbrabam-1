@@ -1,0 +1,411 @@
+/*
+  ======================================================================
+  AX CONTROL - DISBRABAM (VERSÃO TESTE — 10 SEGUNDOS POR FASE)
+  ======================================================================
+*/
+
+#include "thingProperties.h"
+#include <Arduino.h>
+#include "OptaBlue.h"
+#include <rtos.h>
+#include <mbed.h>
+#include <drivers/Watchdog.h>
+
+// --- INSTÂNCIAS DAS EXPANSÕES ---
+DigitalMechExpansion expDigital;
+AnalogExpansion      expAnalog;
+
+// --- MAPEAMENTO ---
+const int IN_REFRIG  = A0;
+const int IN_VENT    = A1;
+const int IN_GAS     = A2;
+const int IN_UMIDIF  = A3;
+
+const int OUT_REFRIG = D0;
+const int OUT_VENT   = D1;
+const int OUT_GAS    = D2;
+const int OUT_UMIDIF = D3;
+
+const int LED_REFRIG = LED_D0;
+const int LED_VENT   = LED_D1;
+const int LED_GAS    = LED_D2;
+const int LED_UMIDIF = LED_D3;
+
+// --- DEBOUNCE ---
+const int NUM_ENTRADAS = 4;
+const int ENTRADAS[NUM_ENTRADAS] = {IN_REFRIG, IN_VENT, IN_GAS, IN_UMIDIF};
+const unsigned long DEBOUNCE_DELAY = 50;
+bool estadoEstavel[NUM_ENTRADAS] = {LOW, LOW, LOW, LOW};
+bool ultimoLeitura[NUM_ENTRADAS] = {LOW, LOW, LOW, LOW};
+unsigned long ultimoTempoDebounce[NUM_ENTRADAS] = {0, 0, 0, 0};
+bool prevEntrada[NUM_ENTRADAS] = {LOW, LOW, LOW, LOW};
+
+// --- ESTADOS ---
+bool estadoRefrig = false;
+bool estadoVent   = false;
+bool estadoGas    = false;
+bool estadoUmidif = false;
+
+// ========================================================================
+// MÁQUINA DE ESTADOS — 10 SEGUNDOS POR FASE
+// ========================================================================
+enum FaseCiclo {
+  FASE_IDLE       = 0,
+  FASE_INJ_1      = 1,
+  FASE_VENT_1     = 2,
+  FASE_INJ_2      = 3,
+  FASE_VENT_2     = 4,
+  FASE_INJ_3      = 5,
+  FASE_CONCLUIDO  = 6
+};
+
+// >>>>> 10 SEGUNDOS <<<<<
+const unsigned long TEMPO_FASE_MS = 10000;
+
+FaseCiclo faseAtual = FASE_IDLE;
+bool cicloAtivo = false;
+unsigned long tempoInicioFase = 0;
+
+const char* nomeFase[] = {
+  "IDLE",
+  "INJECAO 1 (10s)",
+  "VENTILACAO 1 (10s)",
+  "INJECAO 2 (10s)",
+  "VENTILACAO 2 (10s)",
+  "INJECAO 3 (10s)",
+  "CONCLUIDO"
+};
+
+void iniciarCiclo() {
+  cicloAtivo = true;
+  faseAtual = FASE_INJ_1;
+  tempoInicioFase = millis();
+  status_FaseCiclo = 1;
+  Serial.println("=== CICLO DE TESTE INICIADO ===");
+  Serial.println("Fase 1: INJECAO 1 (10s)");
+}
+
+void abortarCiclo() {
+  cicloAtivo = false;
+  faseAtual = FASE_IDLE;
+  status_FaseCiclo = 0;
+  btn_Ciclo = false;
+  Serial.println("=== CICLO ABORTADO ===");
+}
+
+void processarCiclo(unsigned long agora) {
+  if (faseAtual == FASE_IDLE || faseAtual == FASE_CONCLUIDO) return;
+
+  unsigned long decorrido = agora - tempoInicioFase;
+
+  if (decorrido >= TEMPO_FASE_MS) {
+    int faseNum = (int)faseAtual;
+    faseNum++;
+    faseAtual = (FaseCiclo)faseNum;
+    tempoInicioFase = agora;
+    status_FaseCiclo = faseNum;
+
+    Serial.print("Fase avancada para: ");
+    Serial.println(nomeFase[faseNum]);
+
+    if (faseAtual == FASE_CONCLUIDO) {
+      cicloAtivo = false;
+      btn_Ciclo = false;
+      Serial.println("=== CICLO CONCLUIDO ===");
+    }
+  }
+}
+
+// --- MUTEX ---
+rtos::Mutex estadoMutex;
+
+// --- CONECTIVIDADE ---
+bool modoOffline = true;
+bool cloudConectado = false;
+bool cloudSincronizado = false;
+
+void onCloudConnect();
+void onCloudSync();
+void onCloudDisconnect();
+void verificarStatusConectividade();
+
+// ========================================================================
+// THREAD DA CLOUD
+// ========================================================================
+rtos::Thread cloudThread(osPriorityNormal, 8192);
+
+void cloudThreadFunc() {
+  while (true) {
+    ArduinoCloud.update();
+    rtos::ThisThread::sleep_for(20);
+  }
+}
+
+void aplicarIntertravamento() {
+  if (estadoRefrig) {
+    estadoVent = true;
+  }
+  if (estadoUmidif) {
+    estadoVent = true;
+  }
+}
+
+// ========================================================================
+// SETUP
+// ========================================================================
+void setup() {
+  Serial.begin(9600);
+  delay(1500);
+
+  initProperties();
+  ArduinoCloud.begin(ArduinoIoTPreferredConnection, false);
+
+  ArduinoCloud.addCallback(ArduinoIoTCloudEvent::CONNECT, onCloudConnect);
+  ArduinoCloud.addCallback(ArduinoIoTCloudEvent::SYNC, onCloudSync);
+  ArduinoCloud.addCallback(ArduinoIoTCloudEvent::DISCONNECT, onCloudDisconnect);
+
+  modoOffline = true;
+  cloudConectado = false;
+  cloudSincronizado = false;
+
+  setDebugMessageLevel(0);
+  ArduinoCloud.printDebugInfo();
+
+  cloudThread.start(cloudThreadFunc);
+  delay(100);
+
+  mbed::Watchdog::get_instance().start(10000);
+
+  OptaController.begin();
+  delay(1000);
+  OptaController.update();
+
+  if (OptaController.getExpansionNum() < 2) {
+    Serial.println("ERRO FATAL: Expansoes nao detectadas!");
+    pinMode(LEDR, OUTPUT);
+    digitalWrite(LEDR, HIGH);
+    while (true) {
+      mbed::Watchdog::get_instance().kick();
+      delay(1000);
+    }
+  }
+
+  expDigital = OptaController.getExpansion(0);
+  expAnalog  = OptaController.getExpansion(1);
+  expAnalog.beginChannelAsCurrentAdc(OA_CH_0);
+
+  for (int i = 0; i < NUM_ENTRADAS; i++) {
+    pinMode(ENTRADAS[i], INPUT);
+  }
+
+  pinMode(OUT_REFRIG, OUTPUT);
+  pinMode(OUT_VENT, OUTPUT);
+  pinMode(OUT_GAS, OUTPUT);
+  pinMode(OUT_UMIDIF, OUTPUT);
+
+  pinMode(LED_REFRIG, OUTPUT);
+  pinMode(LED_VENT, OUTPUT);
+  pinMode(LED_GAS, OUTPUT);
+  pinMode(LED_UMIDIF, OUTPUT);
+
+  digitalWrite(OUT_REFRIG, LOW); digitalWrite(LED_REFRIG, LOW);
+  digitalWrite(OUT_VENT, LOW);   digitalWrite(LED_VENT, LOW);
+  digitalWrite(OUT_GAS, LOW);    digitalWrite(LED_GAS, LOW);
+  digitalWrite(OUT_UMIDIF, LOW); digitalWrite(LED_UMIDIF, LOW);
+
+  Serial.println("=== SISTEMA PRONTO — MODO TESTE (10s por fase) ===");
+}
+
+// ========================================================================
+// LOOP
+// ========================================================================
+void loop() {
+  mbed::Watchdog::get_instance().kick();
+
+  static unsigned long ultimaVerificacao = 0;
+  if ((millis() - ultimaVerificacao) >= 10000) {
+    verificarStatusConectividade();
+    ultimaVerificacao = millis();
+  }
+
+  unsigned long agora = millis();
+
+  OptaController.update();
+  expAnalog.updateAnalogInputs();
+
+  // 1. SENSOR
+  float corrente_mA = expAnalog.pinCurrent(OA_CH_0);
+  float ppm_calculado = 0.0;
+  if (corrente_mA >= 4.0) {
+    ppm_calculado = (corrente_mA - 4.0) * 12.5;
+    if (ppm_calculado > 200.0) ppm_calculado = 200.0;
+  }
+  leitura_Etil = ppm_calculado;
+
+  // 2. DEBOUNCE
+  for (int i = 0; i < NUM_ENTRADAS; i++) {
+    bool leituraAtual = digitalRead(ENTRADAS[i]);
+    if (leituraAtual != ultimoLeitura[i]) {
+      ultimoTempoDebounce[i] = agora;
+    }
+    if ((agora - ultimoTempoDebounce[i]) > DEBOUNCE_DELAY) {
+      estadoEstavel[i] = leituraAtual;
+    }
+    ultimoLeitura[i] = leituraAtual;
+  }
+
+  // 3. PULSOS FÍSICOS
+  for (int i = 0; i < NUM_ENTRADAS; i++) {
+    bool entrada = estadoEstavel[i];
+    if (entrada && !prevEntrada[i]) {
+      estadoMutex.lock();
+      if (i == 2 && cicloAtivo) {
+        abortarCiclo();
+      } else {
+        switch (i) {
+          case 0: estadoRefrig = !estadoRefrig; break;
+          case 1: estadoVent   = !estadoVent;   break;
+          case 2: estadoGas    = !estadoGas;    break;
+          case 3: estadoUmidif = !estadoUmidif; break;
+        }
+      }
+      estadoMutex.unlock();
+    }
+    prevEntrada[i] = entrada;
+  }
+
+  // 4. MÁQUINA DE ESTADOS
+  if (cicloAtivo) {
+    processarCiclo(agora);
+  }
+
+  // 5. OVERRIDES + INTERTRAVAMENTO
+  estadoMutex.lock();
+
+  if (cicloAtivo) {
+    estadoGas = (faseAtual == FASE_INJ_1 ||
+                 faseAtual == FASE_INJ_2 ||
+                 faseAtual == FASE_INJ_3);
+
+    estadoVent = (faseAtual == FASE_VENT_1 || faseAtual == FASE_VENT_2 ||
+                  faseAtual == FASE_INJ_1  || faseAtual == FASE_INJ_2  ||
+                  faseAtual == FASE_INJ_3);
+  } else if (faseAtual == FASE_CONCLUIDO) {
+    // CORREÇÃO: desliga TUDO ao concluir
+    estadoGas = false;
+    estadoVent = false;
+    faseAtual = FASE_IDLE;
+  }
+
+  aplicarIntertravamento();
+
+  bool saidaRefrig = estadoRefrig;
+  bool saidaVent   = estadoVent;
+  bool saidaGas    = estadoGas;
+  bool saidaUmidif = estadoUmidif;
+  estadoMutex.unlock();
+
+  // 6. SYNC CLOUD
+  static unsigned long ultimoStatusCloud = 0;
+  if ((agora - ultimoStatusCloud) >= 1000) {
+    status_Refrig = saidaRefrig;
+    status_Vent   = saidaVent;
+    status_Gas    = saidaGas;
+    status_Umidif = saidaUmidif;
+
+    btn_Refrig = saidaRefrig;
+    btn_Vent   = saidaVent;
+    btn_Gas    = saidaGas;
+    btn_Umidif = saidaUmidif;
+
+    ultimoStatusCloud = agora;
+  }
+
+  // 7. RELÉS
+  digitalWrite(OUT_REFRIG, saidaRefrig ? HIGH : LOW);
+  digitalWrite(OUT_VENT,   saidaVent   ? HIGH : LOW);
+  digitalWrite(OUT_GAS,    saidaGas    ? HIGH : LOW);
+  digitalWrite(OUT_UMIDIF, saidaUmidif ? HIGH : LOW);
+
+  // 8. LEDs
+  digitalWrite(LED_REFRIG, saidaRefrig ? HIGH : LOW);
+  digitalWrite(LED_VENT,   saidaVent   ? HIGH : LOW);
+  digitalWrite(LED_GAS,    saidaGas    ? HIGH : LOW);
+  digitalWrite(LED_UMIDIF, saidaUmidif ? HIGH : LOW);
+}
+
+// ========================================================================
+// CONECTIVIDADE
+// ========================================================================
+void verificarStatusConectividade() {
+  bool agoraConectado = ArduinoCloud.connected();
+  if (agoraConectado && !cloudConectado) {
+    onCloudConnect();
+  } else if (!agoraConectado && cloudConectado) {
+    onCloudDisconnect();
+  }
+}
+
+void onCloudConnect() {
+  cloudConectado = true;
+  modoOffline = false;
+  cloudSincronizado = false;
+}
+
+void onCloudSync() {
+  cloudSincronizado = true;
+}
+
+void onCloudDisconnect() {
+  cloudConectado = false;
+  cloudSincronizado = false;
+  modoOffline = true;
+}
+
+// ========================================================================
+// CALLBACKS
+// ========================================================================
+void onBtnCicloChange() {
+  if (btn_Ciclo) {
+    iniciarCiclo();
+  } else {
+    estadoMutex.lock();
+    abortarCiclo();
+    estadoMutex.unlock();
+  }
+}
+
+void onBtnGasChange() {
+  estadoMutex.lock();
+  if (cicloAtivo) {
+    abortarCiclo();
+  } else {
+    estadoGas = btn_Gas;
+  }
+  estadoMutex.unlock();
+}
+
+void onBtnRefrigChange() {
+  estadoMutex.lock();
+  estadoRefrig = btn_Refrig;
+  estadoMutex.unlock();
+}
+
+void onBtnUmidifChange() {
+  estadoMutex.lock();
+  estadoUmidif = btn_Umidif;
+  estadoMutex.unlock();
+}
+
+void onBtnVentChange() {
+  estadoMutex.lock();
+  estadoVent = btn_Vent;
+  estadoMutex.unlock();
+}
+
+void onLeituraEtilChange() {}
+void onStatusGasChange() {}
+void onStatusRefrigChange() {}
+void onStatusUmidifChange() {}
+void onStatusVentChange() {}
+void onStatusFaseCicloChange() {}
