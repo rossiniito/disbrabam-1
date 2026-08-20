@@ -1,10 +1,11 @@
 /* ======================================================================
-   AX CONTROL - TESTE DE BANCADA: PORTÃO + BIOMETRIA + BYPASS (8A.58)
+   AX CONTROL - TESTE DE BANCADA: PORTÃO (PULSO) + BIOMETRIA + BYPASS
    Desenvolvedor: Rossini
    Objetivo: 
-   - I1 e I2 operam o portão com intertravamento.
-   - I3 libera as botoeiras por 10s (Modo Seguro).
-   - I4 ativa/desativa a exigência da biometria (Modo Bypass).
+   - I1 e I2 enviam pulsos para Q3 e Q4 (apenas se liberado).
+   - I3 (Stop) envia pulso para Q6 sempre que pressionado (Supremo).
+   - I4 libera as botoeiras por 10s (Botões livres durante toda a janela).
+   - I5 ativa/desativa a exigência da biometria (Modo Bypass).
    ====================================================================== */
 
 #include "OptaBlue.h"
@@ -12,37 +13,47 @@ using namespace Opta;
 
 DigitalMechExpansion expDigital;
 
-// --- Mapeamento de Pinos da Expansão 8A.58 ---
-const int EXP_IN_ABRE   = 0; // I1: Botão Abre 
-const int EXP_IN_FECHA  = 1; // I2: Botão Fecha 
-const int EXP_IN_BIO    = 2; // I3: Pulso Biometria
-const int EXP_IN_BYPASS = 3; // I4: Pulso Habilita/Desabilita Biometria
+// --- Mapeamento de Pinos (Expansão 8A.58) ---
+const int EXP_IN_ABRE   = 0; // I1: Abre (NA)
+const int EXP_IN_FECHA  = 1; // I2: Fecha (NA)
+const int EXP_IN_STOP   = 2; // I3: Stop (NF)
+const int EXP_IN_BIO    = 3; // I4: Pulso Biometria
+const int EXP_IN_BYPASS = 4; // I5: Pulso Bypass
 
-const int EXP_OUT_ABRE  = 0; // Q1: Relé Abre 
-const int EXP_OUT_FECHA = 1; // Q2: Relé Fecha 
+const int EXP_OUT_ABRE  = 2; // Q3: Relé Abre 
+const int EXP_OUT_FECHA = 3; // Q4: Relé Fecha 
+const int EXP_OUT_STOP  = 5; // Q6: Relé Stop (Auxiliar 38.32)
 
 // --- Variáveis de Estado e Debounce ---
 const unsigned long TEMPO_DEBOUNCE = 50;
 
-bool estadoAbre = false, estadoFecha = false, estadoBio = false, estadoBypass = false;
-bool ultimoAbre = false, ultimoFecha = false, ultimoBio = false, ultimoBypass = false;
-unsigned long debounceAbre = 0, debounceFecha = 0, debounceBio = 0, debounceBypass = 0;
+bool estAbre = false, estFecha = false, estStop = false, estBio = false, estBypass = false;
+bool ultAbre = false, ultFecha = false, ultStop = false, ultBio = false, ultBypass = false;
+bool estavelAbre = false, estavelFecha = false, estavelStop = false, estavelBio = false, estavelBypass = false;
 
-// --- Lógica de Temporização da Biometria e Bypass ---
-const unsigned long TEMPO_LIBERACAO = 10000; // 10 segundos
+unsigned long dbAbre = 0, dbFecha = 0, dbStop = 0, dbBio = 0, dbBypass = 0;
+
+// --- Variáveis dos Pulsos de Saída ---
+const unsigned long DURACAO_PULSO = 500; // 500ms
+
+bool pulsoAbreAtivo = false, pulsoFechaAtivo = false, pulsoStopAtivo = false;
+unsigned long inicioPulsoAbre = 0, inicioPulsoFecha = 0, inicioPulsoStop = 0;
+
+// --- Lógica de Biometria e Bypass ---
+const unsigned long TEMPO_LIBERACAO = 10000; // 10s de janela de liberação
+bool biometriaHabilitada = true; // Começa bloqueado (Seguro)
 bool botoeiraLiberada = false;
-bool estadoBioAnterior = false;
 unsigned long tempoInicioLiberacao = 0;
 
-bool biometriaHabilitada = true; // O sistema inicia exigindo biometria
+bool estadoBioAnterior = false;
 bool estadoBypassAnterior = false;
 
 void setup() {
   Serial.begin(115200);
   delay(2000); 
-  Serial.println("=====================================================");
-  Serial.println(" TESTE: PORTÃO + TRAVA BIOMÉTRICA + CHAVE BYPASS ");
-  Serial.println("=====================================================");
+  Serial.println("=========================================================");
+  Serial.println(" TESTE REAL: PORTAO (PULSO) + BIOMETRIA (I4) + BYPASS (I5)");
+  Serial.println("=========================================================");
   Serial.println(">> MODO ATUAL: SEGURO (Biometria Exigida)");
 
   OptaController.begin();
@@ -54,6 +65,7 @@ void setup() {
     Serial.println(">> Sucesso: Expansão 8A.58 Detectada!");
     expDigital.digitalWrite(EXP_OUT_ABRE, LOW);
     expDigital.digitalWrite(EXP_OUT_FECHA, LOW);
+    expDigital.digitalWrite(EXP_OUT_STOP, LOW);
     expDigital.updateDigitalOutputs();
   } else {
     Serial.println(">> ERRO: Expansão não encontrada.");
@@ -65,101 +77,108 @@ void loop() {
 
   if (expDigital) {
     unsigned long agora = millis();
-
-    // 1. OBRIGATÓRIO: Força a busca dos dados físicos da expansão
     expDigital.updateDigitalInputs();
 
-    // 2. Leitura bruta das entradas da Expansão
-    bool leituraAbre   = (expDigital.digitalRead(EXP_IN_ABRE) == HIGH);
-    bool leituraFecha  = (expDigital.digitalRead(EXP_IN_FECHA) == HIGH);
+    // 1. LEITURA BRUTA
+    bool leituraAbre   = (expDigital.digitalRead(EXP_IN_ABRE) == HIGH); 
+    bool leituraFecha  = (expDigital.digitalRead(EXP_IN_FECHA) == HIGH); 
+    bool leituraStop   = (expDigital.digitalRead(EXP_IN_STOP) == LOW); // Stop é NF
     bool leituraBio    = (expDigital.digitalRead(EXP_IN_BIO) == HIGH);
     bool leituraBypass = (expDigital.digitalRead(EXP_IN_BYPASS) == HIGH);
 
-    // 3. Filtro de Ruído (Debounce)
-    if (leituraAbre != ultimoAbre) debounceAbre = agora;
-    if (leituraFecha != ultimoFecha) debounceFecha = agora;
-    if (leituraBio != ultimoBio) debounceBio = agora;
-    if (leituraBypass != ultimoBypass) debounceBypass = agora;
+    // 2. FILTRO DE RUÍDO (Debounce)
+    if (leituraAbre != ultAbre) dbAbre = agora;
+    if (leituraFecha != ultFecha) dbFecha = agora;
+    if (leituraStop != ultStop) dbStop = agora;
+    if (leituraBio != ultBio) dbBio = agora;
+    if (leituraBypass != ultBypass) dbBypass = agora;
 
-    if ((agora - debounceAbre) >= TEMPO_DEBOUNCE) estadoAbre = leituraAbre;
-    if ((agora - debounceFecha) >= TEMPO_DEBOUNCE) estadoFecha = leituraFecha;
-    if ((agora - debounceBio) >= TEMPO_DEBOUNCE) estadoBio = leituraBio;
-    if ((agora - debounceBypass) >= TEMPO_DEBOUNCE) estadoBypass = leituraBypass;
+    if ((agora - dbAbre) >= TEMPO_DEBOUNCE) estavelAbre = leituraAbre;
+    if ((agora - dbFecha) >= TEMPO_DEBOUNCE) estavelFecha = leituraFecha;
+    if ((agora - dbStop) >= TEMPO_DEBOUNCE) estavelStop = leituraStop;
+    if ((agora - dbBio) >= TEMPO_DEBOUNCE) estavelBio = leituraBio;
+    if ((agora - dbBypass) >= TEMPO_DEBOUNCE) estavelBypass = leituraBypass;
 
-    ultimoAbre = leituraAbre;
-    ultimoFecha = leituraFecha;
-    ultimoBio = leituraBio;
-    ultimoBypass = leituraBypass;
+    ultAbre = leituraAbre; ultFecha = leituraFecha; ultStop = leituraStop;
+    ultBio = leituraBio; ultBypass = leituraBypass;
 
-    // 4. LÓGICA DO BYPASS (HABILITA/DESABILITA BIOMETRIA)
-    bool bypassAtivou = (estadoBypass && !estadoBypassAnterior);
-    if (bypassAtivou) {
-      biometriaHabilitada = !biometriaHabilitada; // Inverte o estado (Toggle)
-      
+    // 3. DETECÇÃO DE BORDA
+    bool apertouAbre   = (estavelAbre && !estAbre);
+    bool apertouFecha  = (estavelFecha && !estFecha);
+    bool apertouStop   = (estavelStop && !estStop);
+    bool apertouBio    = (estavelBio && !estadoBioAnterior);
+    bool apertouBypass = (estavelBypass && !estadoBypassAnterior);
+
+    estAbre = estavelAbre; estFecha = estavelFecha; estStop = estavelStop;
+    estadoBioAnterior = estavelBio; estadoBypassAnterior = estavelBypass;
+
+    // 4. LÓGICA DO BYPASS (I5)
+    if (apertouBypass) {
+      biometriaHabilitada = !biometriaHabilitada; 
       if (biometriaHabilitada) {
-        Serial.println("\n[SISTEMA] >> MODO SEGURO ATIVADO: Biometria agora é OBRIGATÓRIA.");
-        botoeiraLiberada = false; // Corta qualquer acesso residual na hora
+        Serial.println("\n[SISTEMA] >> MODO SEGURO: Biometria OBRIGATORIA.");
+        botoeiraLiberada = false; 
       } else {
-        Serial.println("\n[SISTEMA] >> MODO BYPASS ATIVADO: Botoeiras Livres (Biometria ignorada).");
+        Serial.println("\n[SISTEMA] >> MODO BYPASS: Botoeiras Livres.");
       }
     }
-    estadoBypassAnterior = estadoBypass;
 
-    // 5. LÓGICA DO TEMPORIZADOR BIOMÉTRICO (Só funciona se estiver habilitada)
-    if (biometriaHabilitada) {
-      bool bioAtivou = (estadoBio && !estadoBioAnterior);
-      if (bioAtivou) {
-        botoeiraLiberada = true;
-        tempoInicioLiberacao = agora;
-        Serial.println("\n[BIOMETRIA] >> ACESSO LIBERADO! Você tem 10 segundos para operar o portão.");
-      }
-      
-      if (botoeiraLiberada && (agora - tempoInicioLiberacao >= TEMPO_LIBERACAO)) {
-        botoeiraLiberada = false;
-        Serial.println("\n[BIOMETRIA] >> TEMPO ESGOTADO! Botoeiras bloqueadas novamente.");
-      }
+    // 5. LÓGICA DA BIOMETRIA (I4)
+    if (biometriaHabilitada && apertouBio) {
+      botoeiraLiberada = true;
+      tempoInicioLiberacao = agora;
+      Serial.println("\n[BIOMETRIA] >> ACESSO LIBERADO! 10 segundos para operar livremente.");
     }
-    estadoBioAnterior = estadoBio;
+    
+    // Fechamento da janela de tempo
+    if (botoeiraLiberada && (agora - tempoInicioLiberacao >= TEMPO_LIBERACAO)) {
+      botoeiraLiberada = false;
+      Serial.println("\n[BIOMETRIA] >> TEMPO ESGOTADO! Botoeiras bloqueadas.");
+    }
 
-    // 6. MÁQUINA DE ESTADOS E INTERTRAVAMENTO DO MOTOR
-    bool comandoSaidaAbre = false;
-    bool comandoSaidaFecha = false;
+    // Permissão final para os botões de movimento
+    bool permissaoAcesso = (!biometriaHabilitada) || botoeiraLiberada;
 
-    // A permissão final depende do Bypass ou da Liberação da Biometria
-    bool permissaoDeOperacao = (!biometriaHabilitada) || (botoeiraLiberada);
-
-    if (permissaoDeOperacao) {
-      // Regra de segurança contra curto-circuito no motor
-      if (estadoAbre && estadoFecha) {
-        comandoSaidaAbre = false;
-        comandoSaidaFecha = false;
-      } else {
-        comandoSaidaAbre = estadoAbre;
-        comandoSaidaFecha = estadoFecha;
-      }
+    // 6. GATILHO DOS PULSOS
+    if (apertouStop) {
+      pulsoStopAtivo = true;
+      inicioPulsoStop = agora;
+      pulsoAbreAtivo = false; pulsoFechaAtivo = false;
+      Serial.println("[BOTOEIRA] >> STOP (Q6)");
     } 
-    else {
-      // Força os motores a desligar se não houver permissão
-      comandoSaidaAbre = false;
-      comandoSaidaFecha = false;
+    else if (permissaoAcesso) {
+      if (apertouAbre && !apertouFecha && !pulsoStopAtivo) {
+        pulsoAbreAtivo = true;
+        inicioPulsoAbre = agora;
+        pulsoFechaAtivo = false;
+        Serial.println("[BOTOEIRA] >> ABRIR (Q3)");
+        // Removida a trava que consumia o acesso. Agora fica livre os 10s.
+      }
+      else if (apertouFecha && !apertouAbre && !pulsoStopAtivo) {
+        pulsoFechaAtivo = true;
+        inicioPulsoFecha = agora;
+        pulsoAbreAtivo = false;
+        Serial.println("[BOTOEIRA] >> FECHAR (Q4)");
+        // Removida a trava que consumia o acesso. Agora fica livre os 10s.
+      }
     }
 
-    // 7. Escreve nas saídas da Expansão
-    expDigital.digitalWrite(EXP_OUT_ABRE, comandoSaidaAbre ? HIGH : LOW);
-    expDigital.digitalWrite(EXP_OUT_FECHA, comandoSaidaFecha ? HIGH : LOW);
+    // 7. DESLIGAMENTO DOS PULSOS (Timer de 500ms)
+    if (pulsoAbreAtivo && (agora - inicioPulsoAbre >= DURACAO_PULSO)) {
+      pulsoAbreAtivo = false;
+    }
+    if (pulsoFechaAtivo && (agora - inicioPulsoFecha >= DURACAO_PULSO)) {
+      pulsoFechaAtivo = false;
+    }
+    if (pulsoStopAtivo && (agora - inicioPulsoStop >= DURACAO_PULSO)) {
+      pulsoStopAtivo = false;
+    }
+
+    // 8. ENVIA OS PULSOS PARA OS RELÉS FÍSICOS
+    expDigital.digitalWrite(EXP_OUT_ABRE, pulsoAbreAtivo ? HIGH : LOW);
+    expDigital.digitalWrite(EXP_OUT_FECHA, pulsoFechaAtivo ? HIGH : LOW);
+    expDigital.digitalWrite(EXP_OUT_STOP, pulsoStopAtivo ? HIGH : LOW);
     expDigital.updateDigitalOutputs(); 
-
-    // 8. Monitoramento para a Bancada
-    static bool logAbre = false, logFecha = false;
-    if (comandoSaidaAbre != logAbre || comandoSaidaFecha != logFecha) {
-      logAbre = comandoSaidaAbre;
-      logFecha = comandoSaidaFecha;
-      
-      Serial.print("[PORTÃO] Comando -> ABRE: ");
-      Serial.print(comandoSaidaAbre ? "LIGADO " : "DESLIGADO");
-      Serial.print(" | FECHA: ");
-      Serial.println(comandoSaidaFecha ? "LIGADO " : "DESLIGADO");
-    }
   }
 
   delay(10); 
