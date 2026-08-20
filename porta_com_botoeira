@@ -1,0 +1,144 @@
+/* ======================================================================
+   AX CONTROL - TESTE: PORTÃO (SAÍDAS Q3, Q4, Q6)
+   Desenvolvedor: Rossini
+   Objetivo: Ler botoeira real (Abre NA, Fecha NA, Stop NF) e enviar 
+   PULSOS de 500ms para as saídas Q3, Q4 e Q6 da Expansão 8A.58.
+   ====================================================================== */
+
+#include "OptaBlue.h"
+using namespace Opta;
+
+DigitalMechExpansion expDigital;
+
+// --- Mapeamento de Entradas (I1 a I3) ---
+const int EXP_IN_ABRE  = 0; // I1: Botão Abre (NA - Fio Verde)
+const int EXP_IN_FECHA = 1; // I2: Botão Fecha (NA - Fio Vermelho)
+const int EXP_IN_STOP  = 2; // I3: Botão Stop (NF - Fio Amarelo)
+
+// --- Mapeamento de Saídas (Q3, Q4 e Q6) ---
+const int EXP_OUT_ABRE  = 2; // Q3 (Índice 2): Relé Abre (Sobe)
+const int EXP_OUT_FECHA = 3; // Q4 (Índice 3): Relé Fecha (Desce)
+const int EXP_OUT_STOP  = 5; // Q6 (Índice 5): Relé Stop (Para) <--- ATUALIZADO
+
+// --- Variáveis de Estado e Debounce ---
+const unsigned long TEMPO_DEBOUNCE = 50;
+bool estadoAbre = false, estadoFecha = false, estadoStop = false;
+bool ultimoAbre = false, ultimoFecha = false, ultimoStop = false;
+bool estavelAbre = false, estavelFecha = false, estavelStop = false;
+unsigned long debounceAbre = 0, debounceFecha = 0, debounceStop = 0;
+
+// --- Variáveis dos Pulsos de Saída ---
+const unsigned long DURACAO_PULSO = 500; // Tempo do "toque" (Meio segundo)
+
+bool pulsoAbreAtivo = false;
+bool pulsoFechaAtivo = false;
+bool pulsoStopAtivo = false;
+
+unsigned long inicioPulsoAbre = 0;
+unsigned long inicioPulsoFecha = 0;
+unsigned long inicioPulsoStop = 0;
+
+void setup() {
+  Serial.begin(115200);
+  delay(2000); 
+  Serial.println("==================================================");
+  Serial.println(" TESTE REAL: PORTÃO (SAÍDAS Q3, Q4, Q6) ");
+  Serial.println("==================================================");
+
+  OptaController.begin();
+  delay(500);
+
+  expDigital = OptaController.getExpansion(0);
+
+  if (expDigital) {
+    Serial.println(">> Sucesso: Expansão 8A.58 Detectada!");
+    // Garante que as saídas iniciem desligadas
+    expDigital.digitalWrite(EXP_OUT_ABRE, LOW);
+    expDigital.digitalWrite(EXP_OUT_FECHA, LOW);
+    expDigital.digitalWrite(EXP_OUT_STOP, LOW);
+    expDigital.updateDigitalOutputs();
+  } else {
+    Serial.println(">> ERRO: Expansão não encontrada.");
+  }
+}
+
+void loop() {
+  OptaController.update();
+
+  if (expDigital) {
+    unsigned long agora = millis();
+    expDigital.updateDigitalInputs();
+
+    // 1. LEITURA BRUTA
+    bool leituraAbre  = (expDigital.digitalRead(EXP_IN_ABRE) == HIGH); 
+    bool leituraFecha = (expDigital.digitalRead(EXP_IN_FECHA) == HIGH); 
+    
+    // O Stop é NF. A leitura lógica é invertida.
+    bool leituraStop  = (expDigital.digitalRead(EXP_IN_STOP) == LOW); 
+
+    // 2. FILTRO DE RUÍDO (Debounce)
+    if (leituraAbre != ultimoAbre) debounceAbre = agora;
+    if (leituraFecha != ultimoFecha) debounceFecha = agora;
+    if (leituraStop != ultimoStop) debounceStop = agora;
+
+    if ((agora - debounceAbre) >= TEMPO_DEBOUNCE) estavelAbre = leituraAbre;
+    if ((agora - debounceFecha) >= TEMPO_DEBOUNCE) estavelFecha = leituraFecha;
+    if ((agora - debounceStop) >= TEMPO_DEBOUNCE) estavelStop = leituraStop;
+
+    // 3. DETECÇÃO DE BORDA 
+    bool apertouAbre  = (estavelAbre && !estadoAbre);
+    bool apertouFecha = (estavelFecha && !estadoFecha);
+    bool apertouStop  = (estavelStop && !estadoStop);
+
+    estadoAbre = estavelAbre;
+    estadoFecha = estavelFecha;
+    estadoStop = estavelStop;
+    ultimoAbre = leituraAbre;
+    ultimoFecha = leituraFecha;
+    ultimoStop = leituraStop;
+
+    // 4. GATILHO DOS PULSOS
+    if (apertouStop) {
+      pulsoStopAtivo = true;
+      inicioPulsoStop = agora;
+      
+      pulsoAbreAtivo = false;
+      pulsoFechaAtivo = false;
+      Serial.println("\n[BOTOEIRA] >> Apertou STOP -> Enviando Pulso Q6 (PARA)");
+    } 
+    else if (apertouAbre && !apertouFecha && !pulsoStopAtivo) {
+      pulsoAbreAtivo = true;
+      inicioPulsoAbre = agora;
+      pulsoFechaAtivo = false;
+      Serial.println("\n[BOTOEIRA] >> Apertou ABRIR -> Enviando Pulso Q3 (SOBE)");
+    }
+    else if (apertouFecha && !apertouAbre && !pulsoStopAtivo) {
+      pulsoFechaAtivo = true;
+      inicioPulsoFecha = agora;
+      pulsoAbreAtivo = false;
+      Serial.println("\n[BOTOEIRA] >> Apertou FECHAR -> Enviando Pulso Q4 (DESCE)");
+    }
+
+    // 5. DESLIGAMENTO DOS PULSOS (Timer de 500ms)
+    if (pulsoAbreAtivo && (agora - inicioPulsoAbre >= DURACAO_PULSO)) {
+      pulsoAbreAtivo = false;
+      Serial.println("[OPTA] Pulso Q3 concluído.");
+    }
+    if (pulsoFechaAtivo && (agora - inicioPulsoFecha >= DURACAO_PULSO)) {
+      pulsoFechaAtivo = false;
+      Serial.println("[OPTA] Pulso Q4 concluído.");
+    }
+    if (pulsoStopAtivo && (agora - inicioPulsoStop >= DURACAO_PULSO)) {
+      pulsoStopAtivo = false;
+      Serial.println("[OPTA] Pulso Q6 concluído.");
+    }
+
+    // 6. ENVIA OS PULSOS PARA OS RELÉS FÍSICOS (Q3, Q4, Q6)
+    expDigital.digitalWrite(EXP_OUT_ABRE, pulsoAbreAtivo ? HIGH : LOW);
+    expDigital.digitalWrite(EXP_OUT_FECHA, pulsoFechaAtivo ? HIGH : LOW);
+    expDigital.digitalWrite(EXP_OUT_STOP, pulsoStopAtivo ? HIGH : LOW);
+    expDigital.updateDigitalOutputs(); 
+  }
+
+  delay(10); 
+}
