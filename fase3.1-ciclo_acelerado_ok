@@ -1,0 +1,484 @@
+/*
+  ======================================================================
+  AX CONTROL - DISBRABAM (SISTEMA AUTÔNOMO DE MATURAÇÃO 72H)
+  Desenvolvedor: Rossini
+  - Coreografia de 3 Dias: Fecha Porta, Religa Máquinas, Espera 10s, Injeta Gás.
+  - T0, T1, T2, T3, T4 e T5 automatizados com inércia física da porta corrigida.
+  ======================================================================
+*/
+
+#include "thingProperties.h"
+#include <Arduino.h>
+#include "OptaBlue.h"
+#include <rtos.h>
+#include <mbed.h>
+#include <drivers/Watchdog.h>
+
+// --- INSTÂNCIAS DAS EXPANSÕES ---
+DigitalMechExpansion expDigital;
+AnalogExpansion      expAnalog;
+
+// ========================================================================
+// 1. MAPEAMENTO DE MÁQUINAS (OPTA BASE)
+// ========================================================================
+const int IN_REFRIG  = A0;
+const int IN_VENT    = A1;
+const int IN_GAS     = A2;
+const int IN_UMIDIF  = A3;
+
+const int OUT_REFRIG = D0;
+const int OUT_VENT   = D1;
+const int OUT_GAS    = D2;
+const int OUT_UMIDIF = D3;
+
+const int LED_REFRIG = LED_D0;
+const int LED_VENT   = LED_D1;
+const int LED_GAS    = LED_D2;
+const int LED_UMIDIF = LED_D3;
+
+const int NUM_ENTRADAS = 4;
+const int ENTRADAS[NUM_ENTRADAS] = {IN_REFRIG, IN_VENT, IN_GAS, IN_UMIDIF};
+const unsigned long DEBOUNCE_DELAY = 50;
+
+bool estadoEstavel[NUM_ENTRADAS] = {LOW, LOW, LOW, LOW};
+bool ultimoLeitura[NUM_ENTRADAS] = {LOW, LOW, LOW, LOW};
+unsigned long ultimoTempoDebounce[NUM_ENTRADAS] = {0, 0, 0, 0};
+bool prevEntrada[NUM_ENTRADAS] = {LOW, LOW, LOW, LOW};
+
+// Estados Latch
+bool estadoRefrig = false;
+bool estadoVent   = false;
+bool estadoGas    = false;
+bool estadoUmidif = false;
+bool estadoCiclo  = false; 
+
+// ========================================================================
+// 2. O CÉREBRO DA MATURAÇÃO AUTÔNOMA (MÁQUINA DE ESTADOS 72H)
+// ========================================================================
+int faseCiclo = 0;
+unsigned long tempoInicioFase = 0;
+bool cicloGasAtivo = false;
+
+// ⚠️ CHAVE DO TEMPO PARA TESTE DE BANCADA (Mude para false na obra!)
+#define ACELERAR_TEMPO true 
+
+// Tempos ajustados para respeitar a inércia física da porta (20 segundos)
+const unsigned long T_PORTA    = ACELERAR_TEMPO ? 25000UL     : 30000UL;        // Teste: 25s | Real: 30s
+const unsigned long T_10_MIN   = ACELERAR_TEMPO ? 40000UL     : 600000UL;       // Teste: 40s | Real: 10 min
+const unsigned long T_4_MIN    = ACELERAR_TEMPO ? 10000UL     : 240000UL;       // Teste: 10s | Real: 4 min
+const unsigned long T_24_HORAS = ACELERAR_TEMPO ? 30000UL     : 86400000UL;     // Teste: 30s | Real: 24 horas
+const unsigned long T_10_SEG   = 10000UL;                                       // Teste/Real: 10 segundos sempre
+
+// ========================================================================
+// 3. MAPEAMENTO DE PORTÃO (EXPANSÃO 8A.58)
+// ========================================================================
+const int EXP_IN_ABRE   = 0; // I1: Abre 
+const int EXP_IN_FECHA  = 1; // I2: Fecha 
+const int EXP_IN_STOP   = 2; // I3: Stop (NF)
+const int EXP_IN_BYPASS = 4; // I5: Bypass
+
+const int EXP_OUT_ABRE  = 2; // Q3: Relé Abre 
+const int EXP_OUT_FECHA = 3; // Q4: Relé Fecha 
+const int EXP_OUT_STOP  = 5; // Q6: Relé Stop
+
+bool estAbre = false, estFecha = false, estStop = false, estBypass = false;
+bool ultAbre = false, ultFecha = false, ultStop = false, ultBypass = false;
+bool estavelAbre = false, estavelFecha = false, estavelStop = false;
+unsigned long dbAbre = 0, dbFecha = 0, dbStop = 0, dbBypass = 0;
+
+const unsigned long DURACAO_PULSO = 500; // 500ms
+bool pulsoAbreAtivo = false, pulsoFechaAtivo = false, pulsoStopAtivo = false;
+unsigned long inicioPulsoAbre = 0, inicioPulsoFecha = 0, inicioPulsoStop = 0;
+
+bool modoBypassAtivo = false; 
+bool estadoBypassAnterior = false;
+
+float tempSimulada = 18.0;
+unsigned long ultimaSimulacao = 0;
+
+rtos::Mutex estadoMutex;
+bool modoOffline = true;
+bool cloudConectado = false;
+bool cloudSincronizado = false;
+
+void onCloudConnect();
+void onCloudSync();
+void onCloudDisconnect();
+void verificarStatusConectividade();
+
+rtos::Thread cloudThread(osPriorityNormal, 8192);
+void cloudThreadFunc() {
+  while (true) {
+    ArduinoCloud.update();
+    rtos::ThisThread::sleep_for(20);
+  }
+}
+
+void aplicarIntertravamento() {
+  if (estadoRefrig) estadoVent = true;
+  if (estadoUmidif) estadoVent = true;
+}
+
+// ========================================================================
+// SETUP
+// ========================================================================
+void setup() {
+  Serial.begin(9600);
+  delay(1500);
+
+  initProperties();
+  ArduinoCloud.begin(ArduinoIoTPreferredConnection, false);
+  ArduinoCloud.addCallback(ArduinoIoTCloudEvent::CONNECT, onCloudConnect);
+  ArduinoCloud.addCallback(ArduinoIoTCloudEvent::SYNC, onCloudSync);
+  ArduinoCloud.addCallback(ArduinoIoTCloudEvent::DISCONNECT, onCloudDisconnect);
+
+  setDebugMessageLevel(0);
+  cloudThread.start(cloudThreadFunc);
+  delay(100);
+
+  mbed::Watchdog::get_instance().start(10000);
+
+  OptaController.begin();
+  delay(1000);
+  OptaController.update();
+
+  if (OptaController.getExpansionNum() < 2) {
+    while (true) { mbed::Watchdog::get_instance().kick(); delay(1000); }
+  }
+
+  expDigital = OptaController.getExpansion(0);
+  expAnalog  = OptaController.getExpansion(1);
+  expAnalog.beginChannelAsCurrentAdc(OA_CH_0);
+
+  for (int i = 0; i < NUM_ENTRADAS; i++) pinMode(ENTRADAS[i], INPUT);
+  pinMode(OUT_REFRIG, OUTPUT); pinMode(OUT_VENT, OUTPUT);
+  pinMode(OUT_GAS, OUTPUT);    pinMode(OUT_UMIDIF, OUTPUT);
+  pinMode(LED_REFRIG, OUTPUT); pinMode(LED_VENT, OUTPUT);
+  pinMode(LED_GAS, OUTPUT);    pinMode(LED_UMIDIF, OUTPUT);
+
+  digitalWrite(OUT_REFRIG, LOW); digitalWrite(LED_REFRIG, LOW);
+  digitalWrite(OUT_VENT, LOW);   digitalWrite(LED_VENT, LOW);
+  digitalWrite(OUT_GAS, LOW);    digitalWrite(LED_GAS, LOW);
+  digitalWrite(OUT_UMIDIF, LOW); digitalWrite(LED_UMIDIF, LOW);
+
+  expDigital.digitalWrite(EXP_OUT_ABRE, LOW);
+  expDigital.digitalWrite(EXP_OUT_FECHA, LOW);
+  expDigital.digitalWrite(EXP_OUT_STOP, LOW);
+  expDigital.updateDigitalOutputs();
+
+  status_sistema = "SISTEMA LIVRE";
+}
+
+// ========================================================================
+// LOOP PRINCIPAL
+// ========================================================================
+void loop() {
+  mbed::Watchdog::get_instance().kick();
+  unsigned long agora = millis();
+
+  static unsigned long ultimaVerificacao = 0;
+  if ((agora - ultimaVerificacao) >= 10000) {
+    verificarStatusConectividade();
+    ultimaVerificacao = agora;
+  }
+
+  OptaController.update();
+  expAnalog.updateAnalogInputs();
+
+  float corrente_mA = expAnalog.pinCurrent(OA_CH_0);
+  float ppm_calculado = (corrente_mA >= 4.0) ? (corrente_mA - 4.0) * 12.5 : 0.0;
+  if (ppm_calculado > 200.0) ppm_calculado = 200.0;
+  leitura_Etil = ppm_calculado;
+
+  for (int i = 0; i < NUM_ENTRADAS; i++) {
+    bool leituraAtual = digitalRead(ENTRADAS[i]);
+    if (leituraAtual != ultimoLeitura[i]) ultimoTempoDebounce[i] = agora;
+    if ((agora - ultimoTempoDebounce[i]) > DEBOUNCE_DELAY) estadoEstavel[i] = leituraAtual;
+    ultimoLeitura[i] = leituraAtual;
+  }
+
+  for (int i = 0; i < NUM_ENTRADAS; i++) {
+    bool entrada = estadoEstavel[i];
+    if (entrada && !prevEntrada[i]) {
+      estadoMutex.lock();
+      switch (i) {
+        case 0: estadoRefrig = !estadoRefrig; break;
+        case 1: estadoVent   = !estadoVent;   break;
+        case 2: estadoGas    = !estadoGas;    break;
+        case 3: estadoUmidif = !estadoUmidif; break;
+      }
+      estadoMutex.unlock();
+    }
+    prevEntrada[i] = entrada;
+  }
+
+  estadoMutex.lock();
+  aplicarIntertravamento();
+
+  // ========================================================================
+  // PROCESSAMENTO DO CICLO DE MATURAÇÃO AUTÔNOMO (72H)
+  // ========================================================================
+  if (!estadoCiclo) {
+    faseCiclo = 0;
+    cicloGasAtivo = false;
+  } else {
+    unsigned long tempoDecorrido = agora - tempoInicioFase;
+
+    switch (faseCiclo) {
+      case 0: // DIA 1 (T0) - FECHAR PORTA
+        faseCiclo = 1; tempoInicioFase = agora; 
+        pulsoFechaAtivo = true; inicioPulsoFecha = agora; 
+        break;
+
+      case 1: // ESPERA PORTA FECHAR FISICAMENTE + LIGA REFRIGERAÇÃO
+        if (tempoDecorrido >= T_PORTA) { 
+          faseCiclo = 2; tempoInicioFase = agora; 
+          estadoRefrig = true; // Força refrigeração a ligar
+          estadoVent = true;   // Força ventilação
+        }
+        break;
+
+      case 2: // AGUARDA 10 SEGUNDOS (Estabilização do ar)
+        if (tempoDecorrido >= T_10_SEG) { 
+          faseCiclo = 3; tempoInicioFase = agora; 
+        }
+        break;
+
+      case 3: // INJEÇÃO 1 (4 MINUTOS)
+        cicloGasAtivo = true;
+        if (tempoDecorrido >= T_4_MIN) { cicloGasAtivo = false; faseCiclo = 4; tempoInicioFase = agora; }
+        break;
+
+      case 4: // MATURAÇÃO 1 (24 HORAS)
+        if (tempoDecorrido >= T_24_HORAS) {
+          faseCiclo = 5; tempoInicioFase = agora;
+          // T1: Desliga refrigeração, mantém ventilação
+          estadoRefrig = false; 
+          estadoVent = true;    
+          pulsoAbreAtivo = true; inicioPulsoAbre = agora; // Abre a porta
+        }
+        break;
+
+      case 5: // VENTILAÇÃO / EVACUAÇÃO DE CO2 (10 MINUTOS)
+        // No modo teste (40s), a porta sobe por 20s e fica aberta por mais 20s.
+        if (tempoDecorrido >= T_10_MIN) {
+          faseCiclo = 6; tempoInicioFase = agora;
+          pulsoFechaAtivo = true; inicioPulsoFecha = agora; // Fecha porta (T2)
+        }
+        break;
+
+      case 6: // ESPERA PORTA FECHAR FISICAMENTE
+        if (tempoDecorrido >= T_PORTA) { 
+          faseCiclo = 7; tempoInicioFase = agora; 
+          estadoRefrig = true; // Volta a ligar a refrigeração
+        }
+        break;
+
+      case 7: // AGUARDA 10 SEGUNDOS
+        if (tempoDecorrido >= T_10_SEG) { 
+          faseCiclo = 8; tempoInicioFase = agora; 
+        }
+        break;
+
+      case 8: // INJEÇÃO 2 (4 MINUTOS)
+        cicloGasAtivo = true;
+        if (tempoDecorrido >= T_4_MIN) { cicloGasAtivo = false; faseCiclo = 9; tempoInicioFase = agora; }
+        break;
+
+      case 9: // MATURAÇÃO 2 (24 HORAS)
+        if (tempoDecorrido >= T_24_HORAS) {
+          faseCiclo = 10; tempoInicioFase = agora;
+          // T3: Desliga refrigeração, mantém ventilação
+          estadoRefrig = false; 
+          estadoVent = true;    
+          pulsoAbreAtivo = true; inicioPulsoAbre = agora; // Abre a porta
+        }
+        break;
+
+      case 10: // VENTILAÇÃO 2 (10 MINUTOS)
+        if (tempoDecorrido >= T_10_MIN) {
+          faseCiclo = 11; tempoInicioFase = agora;
+          pulsoFechaAtivo = true; inicioPulsoFecha = agora; // Fecha porta (T4)
+        }
+        break;
+
+      case 11: // ESPERA PORTA FECHAR FISICAMENTE
+        if (tempoDecorrido >= T_PORTA) { 
+          faseCiclo = 12; tempoInicioFase = agora; 
+          estadoRefrig = true; // Volta a ligar a refrigeração
+        }
+        break;
+
+      case 12: // AGUARDA 10 SEGUNDOS
+        if (tempoDecorrido >= T_10_SEG) { 
+          faseCiclo = 13; tempoInicioFase = agora; 
+        }
+        break;
+
+      case 13: // INJEÇÃO 3 (4 MINUTOS)
+        cicloGasAtivo = true;
+        if (tempoDecorrido >= T_4_MIN) { cicloGasAtivo = false; faseCiclo = 14; tempoInicioFase = agora; }
+        break;
+
+      case 14: // MATURAÇÃO 3 (24 HORAS)
+        if (tempoDecorrido >= T_24_HORAS) {
+          // T5 - FIM DO CICLO
+          estadoCiclo = false; 
+          faseCiclo = 0;
+        }
+        break;
+    }
+  }
+
+  bool saidaRefrig = estadoRefrig;
+  bool saidaVent   = estadoVent;
+  bool saidaGas    = estadoGas || cicloGasAtivo; 
+  bool saidaUmidif = estadoUmidif;
+  bool cicloAtual  = estadoCiclo; 
+  estadoMutex.unlock();
+
+  digitalWrite(OUT_REFRIG, saidaRefrig ? HIGH : LOW); digitalWrite(LED_REFRIG, saidaRefrig ? HIGH : LOW);
+  digitalWrite(OUT_VENT,   saidaVent   ? HIGH : LOW); digitalWrite(LED_VENT,   saidaVent   ? HIGH : LOW);
+  digitalWrite(OUT_GAS,    saidaGas    ? HIGH : LOW); digitalWrite(LED_GAS,    saidaGas    ? HIGH : LOW);
+  digitalWrite(OUT_UMIDIF, saidaUmidif ? HIGH : LOW); digitalWrite(LED_UMIDIF, saidaUmidif ? HIGH : LOW);
+
+  // --- LÓGICA DO PORTÃO E SEGURANÇA ---
+  expDigital.updateDigitalInputs();
+  bool leAbre   = (expDigital.digitalRead(EXP_IN_ABRE) == HIGH);
+  bool leFecha  = (expDigital.digitalRead(EXP_IN_FECHA) == HIGH);
+  bool leStop   = (expDigital.digitalRead(EXP_IN_STOP) == LOW); 
+  bool leBypass = (expDigital.digitalRead(EXP_IN_BYPASS) == HIGH);
+
+  if (leAbre != ultAbre) dbAbre = agora;
+  if (leFecha != ultFecha) dbFecha = agora;
+  if (leStop != ultStop) dbStop = agora;
+  if (leBypass != ultBypass) dbBypass = agora;
+
+  if ((agora - dbAbre) >= DEBOUNCE_DELAY) estavelAbre = leAbre;
+  if ((agora - dbFecha) >= DEBOUNCE_DELAY) estavelFecha = leFecha;
+  if ((agora - dbStop) >= DEBOUNCE_DELAY) estavelStop = leStop;
+  if ((agora - dbBypass) >= DEBOUNCE_DELAY) estBypass = leBypass;
+
+  bool apertouAbre  = (estavelAbre && !estAbre);
+  bool apertouFecha = (estavelFecha && !estFecha);
+  bool apertouStop  = (estavelStop && !estStop);
+  bool ativouBypass = (estBypass && !estadoBypassAnterior);
+
+  estAbre = estavelAbre; estFecha = estavelFecha; estStop = estavelStop;
+  ultAbre = leAbre; ultFecha = leFecha; ultStop = leStop;
+  estadoBypassAnterior = estBypass; ultBypass = leBypass;
+
+  if (ativouBypass) modoBypassAtivo = !modoBypassAtivo;
+
+  bool permissaoAcessoLocal = true; 
+  if (cicloAtual) permissaoAcessoLocal = modoBypassAtivo; 
+
+  if (agora - ultimaSimulacao >= 500) {
+    ultimaSimulacao = agora;
+    tempSimulada = 18.0 + (sin(agora / 3000.0) * 5.0); 
+  }
+
+  bool bloqueioFrio = (tempSimulada < 13.5);
+
+  // --- TEXTOS DO DASHBOARD EXATAMENTE COMO PEDIDO ---
+  if (bloqueioFrio) {
+    status_sistema = "ALARME: CHILLING INJURY!";
+  } else if (!cicloAtual && saidaGas) {
+    status_sistema = "INJECAO MANUAL (PORTA TRAVADA)";
+  } else if (cicloAtual) {
+    switch(faseCiclo) {
+      case 0:  status_sistema = "PREPARANDO CICLO..."; break;
+      case 1:  status_sistema = "FECHANDO PORTA (T0)"; break;
+      case 2:  status_sistema = "AGUARDANDO REFRIGERACAO (10S)"; break;
+      case 3:  status_sistema = "INJETANDO GAS 1 (4 MIN)"; break;
+      case 4:  status_sistema = "MATURANDO 1 (24 HORAS)"; break;
+      case 5:  status_sistema = "EVACUANDO CO2 (10 MIN)"; break;
+      case 6:  status_sistema = "FECHANDO PORTA (T2)"; break;
+      case 7:  status_sistema = "AGUARDANDO REFRIGERACAO (10S)"; break;
+      case 8:  status_sistema = "INJETANDO GAS 2 (4 MIN)"; break;
+      case 9:  status_sistema = "MATURANDO 2 (24 HORAS)"; break;
+      case 10: status_sistema = "EVACUANDO CO2 (10 MIN)"; break;
+      case 11: status_sistema = "FECHANDO PORTA (T4)"; break;
+      case 12: status_sistema = "AGUARDANDO REFRIGERACAO (10S)"; break;
+      case 13: status_sistema = "INJETANDO GAS 3 (4 MIN)"; break;
+      case 14: status_sistema = "MATURANDO 3 (ULTIMAS 24H)"; break;
+    }
+  } else {
+    status_sistema = "SISTEMA LIVRE (Venda)";
+  }
+
+  // --- GATILHO DOS PULSOS ---
+  if (apertouStop || cmd_stop_nuvem) {
+    pulsoStopAtivo = true; inicioPulsoStop = agora;
+    pulsoAbreAtivo = false; pulsoFechaAtivo = false;
+    cmd_stop_nuvem = false; cmd_abre_nuvem = false; cmd_fecha_nuvem = false;
+  } 
+  else if (!saidaGas && !bloqueioFrio) { 
+    if ((apertouAbre && permissaoAcessoLocal) || cmd_abre_nuvem) {
+      pulsoAbreAtivo = true; inicioPulsoAbre = agora; pulsoFechaAtivo = false; cmd_abre_nuvem = false;
+    }
+    else if ((apertouFecha && permissaoAcessoLocal) || cmd_fecha_nuvem) {
+      pulsoFechaAtivo = true; inicioPulsoFecha = agora; pulsoAbreAtivo = false; cmd_fecha_nuvem = false;
+    }
+  } 
+  else {
+    if (cmd_abre_nuvem) cmd_abre_nuvem = false;
+    if (cmd_fecha_nuvem) cmd_fecha_nuvem = false;
+  }
+
+  if (pulsoAbreAtivo && (agora - inicioPulsoAbre >= DURACAO_PULSO)) pulsoAbreAtivo = false;
+  if (pulsoFechaAtivo && (agora - inicioPulsoFecha >= DURACAO_PULSO)) pulsoFechaAtivo = false;
+  if (pulsoStopAtivo && (agora - inicioPulsoStop >= DURACAO_PULSO)) pulsoStopAtivo = false;
+
+  expDigital.digitalWrite(EXP_OUT_ABRE, pulsoAbreAtivo ? HIGH : LOW);
+  expDigital.digitalWrite(EXP_OUT_FECHA, pulsoFechaAtivo ? HIGH : LOW);
+  expDigital.digitalWrite(EXP_OUT_STOP, pulsoStopAtivo ? HIGH : LOW);
+  expDigital.updateDigitalOutputs();
+
+  // --- SINCRONIZAÇÃO NUVEM ---
+  static unsigned long ultimoStatusCloud = 0;
+  if ((agora - ultimoStatusCloud) >= 1000) {
+    status_Refrig = saidaRefrig;
+    status_Vent   = saidaVent;
+    status_Gas    = saidaGas;
+    status_Umidif = saidaUmidif;
+    status_FaseCiclo = faseCiclo;
+
+    btn_Refrig = saidaRefrig;
+    btn_Vent   = saidaVent;
+    btn_Gas    = saidaGas;
+    btn_Umidif = saidaUmidif;
+    btn_Ciclo  = cicloAtual; 
+    
+    cmd_bypass_nuvem = modoBypassAtivo;
+    temp_nuvem = tempSimulada;
+
+    ultimoStatusCloud = agora;
+  }
+}
+
+void verificarStatusConectividade() {
+  bool agoraConectado = ArduinoCloud.connected();
+  if (agoraConectado && !cloudConectado) onCloudConnect();
+  else if (!agoraConectado && cloudConectado) onCloudDisconnect();
+}
+void onCloudConnect() { cloudConectado = true; modoOffline = false; cloudSincronizado = false; }
+void onCloudSync() { cloudSincronizado = true; }
+void onCloudDisconnect() { cloudConectado = false; cloudSincronizado = false; modoOffline = true; }
+
+void onBtnGasChange()    { estadoMutex.lock(); estadoGas = btn_Gas; estadoMutex.unlock(); }
+void onBtnRefrigChange() { estadoMutex.lock(); estadoRefrig = btn_Refrig; estadoMutex.unlock(); }
+void onBtnUmidifChange() { estadoMutex.lock(); estadoUmidif = btn_Umidif; estadoMutex.unlock(); }
+void onBtnVentChange()   { estadoMutex.lock(); estadoVent = btn_Vent; estadoMutex.unlock(); }
+void onBtnCicloChange()  { estadoMutex.lock(); estadoCiclo = btn_Ciclo; estadoMutex.unlock(); }
+void onCmdBypassNuvemChange() { modoBypassAtivo = cmd_bypass_nuvem; }
+
+void onLeituraEtilChange() {}
+void onStatusGasChange() {}
+void onStatusRefrigChange() {}
+void onStatusUmidifChange() {}
+void onStatusVentChange() {}
+void onStatusFaseCicloChange() {}
+void onCmdAbreNuvemChange() {}
+void onCmdFechaNuvemChange() {}
+void onCmdStopNuvemChange() {}
