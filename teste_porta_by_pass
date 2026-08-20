@@ -1,0 +1,166 @@
+/* ======================================================================
+   AX CONTROL - TESTE DE BANCADA: PORTÃO + BIOMETRIA + BYPASS (8A.58)
+   Desenvolvedor: Rossini
+   Objetivo: 
+   - I1 e I2 operam o portão com intertravamento.
+   - I3 libera as botoeiras por 10s (Modo Seguro).
+   - I4 ativa/desativa a exigência da biometria (Modo Bypass).
+   ====================================================================== */
+
+#include "OptaBlue.h"
+using namespace Opta;
+
+DigitalMechExpansion expDigital;
+
+// --- Mapeamento de Pinos da Expansão 8A.58 ---
+const int EXP_IN_ABRE   = 0; // I1: Botão Abre 
+const int EXP_IN_FECHA  = 1; // I2: Botão Fecha 
+const int EXP_IN_BIO    = 2; // I3: Pulso Biometria
+const int EXP_IN_BYPASS = 3; // I4: Pulso Habilita/Desabilita Biometria
+
+const int EXP_OUT_ABRE  = 0; // Q1: Relé Abre 
+const int EXP_OUT_FECHA = 1; // Q2: Relé Fecha 
+
+// --- Variáveis de Estado e Debounce ---
+const unsigned long TEMPO_DEBOUNCE = 50;
+
+bool estadoAbre = false, estadoFecha = false, estadoBio = false, estadoBypass = false;
+bool ultimoAbre = false, ultimoFecha = false, ultimoBio = false, ultimoBypass = false;
+unsigned long debounceAbre = 0, debounceFecha = 0, debounceBio = 0, debounceBypass = 0;
+
+// --- Lógica de Temporização da Biometria e Bypass ---
+const unsigned long TEMPO_LIBERACAO = 10000; // 10 segundos
+bool botoeiraLiberada = false;
+bool estadoBioAnterior = false;
+unsigned long tempoInicioLiberacao = 0;
+
+bool biometriaHabilitada = true; // O sistema inicia exigindo biometria
+bool estadoBypassAnterior = false;
+
+void setup() {
+  Serial.begin(115200);
+  delay(2000); 
+  Serial.println("=====================================================");
+  Serial.println(" TESTE: PORTÃO + TRAVA BIOMÉTRICA + CHAVE BYPASS ");
+  Serial.println("=====================================================");
+  Serial.println(">> MODO ATUAL: SEGURO (Biometria Exigida)");
+
+  OptaController.begin();
+  delay(500);
+
+  expDigital = OptaController.getExpansion(0);
+
+  if (expDigital) {
+    Serial.println(">> Sucesso: Expansão 8A.58 Detectada!");
+    expDigital.digitalWrite(EXP_OUT_ABRE, LOW);
+    expDigital.digitalWrite(EXP_OUT_FECHA, LOW);
+    expDigital.updateDigitalOutputs();
+  } else {
+    Serial.println(">> ERRO: Expansão não encontrada.");
+  }
+}
+
+void loop() {
+  OptaController.update();
+
+  if (expDigital) {
+    unsigned long agora = millis();
+
+    // 1. OBRIGATÓRIO: Força a busca dos dados físicos da expansão
+    expDigital.updateDigitalInputs();
+
+    // 2. Leitura bruta das entradas da Expansão
+    bool leituraAbre   = (expDigital.digitalRead(EXP_IN_ABRE) == HIGH);
+    bool leituraFecha  = (expDigital.digitalRead(EXP_IN_FECHA) == HIGH);
+    bool leituraBio    = (expDigital.digitalRead(EXP_IN_BIO) == HIGH);
+    bool leituraBypass = (expDigital.digitalRead(EXP_IN_BYPASS) == HIGH);
+
+    // 3. Filtro de Ruído (Debounce)
+    if (leituraAbre != ultimoAbre) debounceAbre = agora;
+    if (leituraFecha != ultimoFecha) debounceFecha = agora;
+    if (leituraBio != ultimoBio) debounceBio = agora;
+    if (leituraBypass != ultimoBypass) debounceBypass = agora;
+
+    if ((agora - debounceAbre) >= TEMPO_DEBOUNCE) estadoAbre = leituraAbre;
+    if ((agora - debounceFecha) >= TEMPO_DEBOUNCE) estadoFecha = leituraFecha;
+    if ((agora - debounceBio) >= TEMPO_DEBOUNCE) estadoBio = leituraBio;
+    if ((agora - debounceBypass) >= TEMPO_DEBOUNCE) estadoBypass = leituraBypass;
+
+    ultimoAbre = leituraAbre;
+    ultimoFecha = leituraFecha;
+    ultimoBio = leituraBio;
+    ultimoBypass = leituraBypass;
+
+    // 4. LÓGICA DO BYPASS (HABILITA/DESABILITA BIOMETRIA)
+    bool bypassAtivou = (estadoBypass && !estadoBypassAnterior);
+    if (bypassAtivou) {
+      biometriaHabilitada = !biometriaHabilitada; // Inverte o estado (Toggle)
+      
+      if (biometriaHabilitada) {
+        Serial.println("\n[SISTEMA] >> MODO SEGURO ATIVADO: Biometria agora é OBRIGATÓRIA.");
+        botoeiraLiberada = false; // Corta qualquer acesso residual na hora
+      } else {
+        Serial.println("\n[SISTEMA] >> MODO BYPASS ATIVADO: Botoeiras Livres (Biometria ignorada).");
+      }
+    }
+    estadoBypassAnterior = estadoBypass;
+
+    // 5. LÓGICA DO TEMPORIZADOR BIOMÉTRICO (Só funciona se estiver habilitada)
+    if (biometriaHabilitada) {
+      bool bioAtivou = (estadoBio && !estadoBioAnterior);
+      if (bioAtivou) {
+        botoeiraLiberada = true;
+        tempoInicioLiberacao = agora;
+        Serial.println("\n[BIOMETRIA] >> ACESSO LIBERADO! Você tem 10 segundos para operar o portão.");
+      }
+      
+      if (botoeiraLiberada && (agora - tempoInicioLiberacao >= TEMPO_LIBERACAO)) {
+        botoeiraLiberada = false;
+        Serial.println("\n[BIOMETRIA] >> TEMPO ESGOTADO! Botoeiras bloqueadas novamente.");
+      }
+    }
+    estadoBioAnterior = estadoBio;
+
+    // 6. MÁQUINA DE ESTADOS E INTERTRAVAMENTO DO MOTOR
+    bool comandoSaidaAbre = false;
+    bool comandoSaidaFecha = false;
+
+    // A permissão final depende do Bypass ou da Liberação da Biometria
+    bool permissaoDeOperacao = (!biometriaHabilitada) || (botoeiraLiberada);
+
+    if (permissaoDeOperacao) {
+      // Regra de segurança contra curto-circuito no motor
+      if (estadoAbre && estadoFecha) {
+        comandoSaidaAbre = false;
+        comandoSaidaFecha = false;
+      } else {
+        comandoSaidaAbre = estadoAbre;
+        comandoSaidaFecha = estadoFecha;
+      }
+    } 
+    else {
+      // Força os motores a desligar se não houver permissão
+      comandoSaidaAbre = false;
+      comandoSaidaFecha = false;
+    }
+
+    // 7. Escreve nas saídas da Expansão
+    expDigital.digitalWrite(EXP_OUT_ABRE, comandoSaidaAbre ? HIGH : LOW);
+    expDigital.digitalWrite(EXP_OUT_FECHA, comandoSaidaFecha ? HIGH : LOW);
+    expDigital.updateDigitalOutputs(); 
+
+    // 8. Monitoramento para a Bancada
+    static bool logAbre = false, logFecha = false;
+    if (comandoSaidaAbre != logAbre || comandoSaidaFecha != logFecha) {
+      logAbre = comandoSaidaAbre;
+      logFecha = comandoSaidaFecha;
+      
+      Serial.print("[PORTÃO] Comando -> ABRE: ");
+      Serial.print(comandoSaidaAbre ? "LIGADO " : "DESLIGADO");
+      Serial.print(" | FECHA: ");
+      Serial.println(comandoSaidaFecha ? "LIGADO " : "DESLIGADO");
+    }
+  }
+
+  delay(10); 
+}
